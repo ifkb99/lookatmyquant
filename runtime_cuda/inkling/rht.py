@@ -85,12 +85,14 @@ def rht(x: torch.Tensor, signs: torch.Tensor, out: bool) -> torch.Tensor:
     A, B = _factors(n, x.device)
     a, b = A.shape[0], B.shape[0]
     assert a >= 16 and a & (a - 1) == 0, a
-    IB = min(a, 32)
+    # 16 output rows a program and a contraction chunk of up to 64 rows: same speed as (32, 32) for a <= 32, and
+    # 9.2 -> 6.3 us for n = 3072 (a = 256) inside a CUDA graph on an RTX A4500
+    IB = 16
     y = torch.empty(S * T, n, dtype=torch.float32, device=x.device)
     with torch.cuda.device(x.device):
         _rht_kernel[(S * T, triton.cdiv(b, 16), a // IB)](
             x2, signs, A, B, y, T if signs.shape[0] > 1 else S * T, x2.stride(0), y.stride(0), signs.stride(0),
-            1.0 / math.sqrt(n), a=a, b=b, BP=max(16, triton.next_power_of_2(b)), IB=IB, KC=min(a, 32), OUT=out,
+            1.0 / math.sqrt(n), a=a, b=b, BP=max(16, triton.next_power_of_2(b)), IB=IB, KC=min(a, 64), OUT=out,
             num_warps=4,
         )
     return y.reshape(shape)

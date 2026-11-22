@@ -15,6 +15,11 @@ import sys
 import torch
 
 _libs: dict[str, ctypes.CDLL] = {}
+
+
+def enabled() -> bool:
+    """The experimental CUDA C kernels are on (`LAMQ_CUDA_C=1`); Triton is the default."""
+    return os.environ.get("LAMQ_CUDA_C", "0") not in ("", "0")
 _modules: dict[tuple, tuple] = {}  # (source, device index, options) -> (module, cubin): one compile each
 
 
@@ -73,8 +78,8 @@ def compile_cubin(src: str, name: str, arch: int, options=()) -> bytes:
 
 
 class Kernel:
-    """One `extern "C" __global__` function of `src`, compiled for `device`. Call with tensors (passed as pointers)
-    and Python ints (passed as C `int`), in the kernel's parameter order."""
+    """One `extern "C" __global__` function of `src`, compiled for `device`. Call with tensors (passed as pointers),
+    Python ints (C `int`) and floats (C `float`), in the kernel's parameter order."""
 
     def __init__(self, src: str, func: str, device: torch.device, options=("--use_fast_math",), smem: int = 0):
         self.device = torch.device(device)
@@ -101,6 +106,8 @@ class Kernel:
                 vals.append(ctypes.c_void_p(a.data_ptr()))
             elif isinstance(a, int):
                 vals.append(ctypes.c_int(a))
+            elif isinstance(a, float):
+                vals.append(ctypes.c_float(a))
             else:
                 raise TypeError(f"kernel argument of type {type(a).__name__}")
         ptrs = (ctypes.c_void_p * len(vals))(*[ctypes.cast(ctypes.byref(v), ctypes.c_void_p) for v in vals])

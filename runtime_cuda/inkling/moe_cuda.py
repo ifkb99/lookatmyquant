@@ -10,18 +10,14 @@ tables (E2M1 values, E4M3 block scales) in shared memory the same way.
 """
 from __future__ import annotations
 
-import os
-
 import torch
 
 from .formats import FMT_PARAMS
-from .nvrtc import Kernel
+from .nvrtc import Kernel, enabled  # noqa: F401  (enabled: re-exported)
 
 THREADS = 256
 
 
-def enabled() -> bool:
-    return os.environ.get("LAMQ_CUDA_C", "0") not in ("", "0")
 
 
 def _spec(fmt: str, lut: torch.Tensor):
