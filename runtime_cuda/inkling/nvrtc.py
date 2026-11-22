@@ -15,7 +15,7 @@ import sys
 import torch
 
 _libs: dict[str, ctypes.CDLL] = {}
-_modules: dict[tuple, tuple] = {}  # (source, function, device index) -> (module, function, cubin): one compile each
+_modules: dict[tuple, tuple] = {}  # (source, device index, options) -> (module, cubin): one compile each
 
 
 def _nvrtc() -> ctypes.CDLL:
@@ -78,17 +78,19 @@ class Kernel:
 
     def __init__(self, src: str, func: str, device: torch.device, options=("--use_fast_math",), smem: int = 0):
         self.device = torch.device(device)
-        key = (src, func, self.device.index, tuple(options))
-        if key not in _modules:
+        key = (src, self.device.index, tuple(options))
+        if key not in _modules:  # one compile per source: its kernels share the module
             with torch.cuda.device(self.device):
                 torch.empty(1, device=self.device)  # torch's primary context, current on this thread
                 cc = torch.cuda.get_device_capability(self.device)
                 cubin = compile_cubin(src, func, cc[0] * 10 + cc[1], options)
-                mod, fn = ctypes.c_void_p(), ctypes.c_void_p()
+                mod = ctypes.c_void_p()
                 _check(_cuda().cuModuleLoadData(ctypes.byref(mod), cubin), "cuModuleLoadData")
-                _check(_cuda().cuModuleGetFunction(ctypes.byref(fn), mod, func.encode()), "cuModuleGetFunction")
-            _modules[key] = (mod, fn, cubin)
-        self.module, self.func, self.cubin = _modules[key]
+            _modules[key] = (mod, cubin)
+        self.module, self.cubin = _modules[key]
+        self.func = ctypes.c_void_p()
+        with torch.cuda.device(self.device):
+            _check(_cuda().cuModuleGetFunction(ctypes.byref(self.func), self.module, func.encode()), "cuModuleGetFunction")
         if smem > 48 * 1024:  # CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
             _check(_cuda().cuFuncSetAttribute(self.func, 8, smem), "cuFuncSetAttribute")
 
