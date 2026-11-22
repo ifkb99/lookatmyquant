@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ctypes
 import glob
+import hashlib
 import os
 import sys
 
@@ -57,7 +58,10 @@ def compile_cubin(src: str, name: str, arch: int, options=()) -> bytes:
     """`src` compiled for `sm_{arch}`. Raises with NVRTC's log on a compile error."""
     nv = _nvrtc()
     prog = ctypes.c_void_p()
-    if nv.nvrtcCreateProgram(ctypes.byref(prog), src.encode(), f"{name}.cu".encode(), 0, None, None) != 0:
+    # The program is named after its source's hash: NVRTC 13.0 once returned an empty binary (and reported success)
+    # for one source named "moe_side.cu" that compiled under any other name; the cause is unknown.
+    tag = hashlib.sha1(src.encode()).hexdigest()[:12]
+    if nv.nvrtcCreateProgram(ctypes.byref(prog), src.encode(), f"{name}_{tag}.cu".encode(), 0, None, None) != 0:
         raise RuntimeError("nvrtcCreateProgram failed")
     try:
         opts = [f"--gpu-architecture=sm_{arch}", "--std=c++17", *options]
@@ -69,9 +73,11 @@ def compile_cubin(src: str, name: str, arch: int, options=()) -> bytes:
             nv.nvrtcGetProgramLog(prog, log)
             raise RuntimeError(f"NVRTC could not compile {name}:\n{log.value.decode(errors='replace')}")
         size = ctypes.c_size_t()
-        nv.nvrtcGetCUBINSize(prog, ctypes.byref(size))
+        if nv.nvrtcGetCUBINSize(prog, ctypes.byref(size)) != 0 or size.value == 0:
+            raise RuntimeError(f"NVRTC reported success for {name} but returned no binary")
         buf = ctypes.create_string_buffer(size.value)
-        nv.nvrtcGetCUBIN(prog, buf)
+        if nv.nvrtcGetCUBIN(prog, buf) != 0:
+            raise RuntimeError(f"nvrtcGetCUBIN failed for {name}")
         return buf.raw
     finally:
         nv.nvrtcDestroyProgram(ctypes.byref(prog))

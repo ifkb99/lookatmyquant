@@ -477,9 +477,18 @@ class DenseStageGEMV:
                                 f"CH{i}": CH, f"NW{i}": nw, f"SW{i}": sw})
         self.blocks = rb
         self.nseg = len(mats)
+        from .nvrtc import enabled
+
+        self.cuda_c = None  # the experimental CUDA C stage kernel (dense_cuda.py)
+        if enabled():
+            from .dense_cuda import DenseStageCUDA
+
+            self.cuda_c = DenseStageCUDA(mats, n, x_rows)
 
     def __call__(self, x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
         """x `[R, n]` float32 (stacked inputs); returns the concatenated outputs `[total]`."""
+        if self.cuda_c is not None:
+            return self.cuda_c(x, out=out)
         y = out if out is not None else torch.empty(self.total, dtype=torch.float32, device=x.device)
         with torch.cuda.device(x.device):
             _dense_stage_kernel[(self.blocks,)](x, y, self.n, x.stride(0), *self.args,

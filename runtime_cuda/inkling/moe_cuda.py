@@ -39,9 +39,14 @@ __device__ __forceinline__ float h2f_lo(u32 v) { float a; asm("{.reg .b16 l, h; 
 __device__ __forceinline__ float h2f_hi(u32 v) { float a; asm("{.reg .b16 l, h; mov.b32 {l, h}, %1; cvt.f32.f16 %0, h;}" : "=f"(a) : "r"(v)); return a; }
 __device__ __forceinline__ float h1f(u16 v) { float a; asm("cvt.f32.f16 %0, %1;" : "=f"(a) : "h"(v)); return a; }
 
+__device__ __forceinline__ float tab1(float v) { return v; }
+__device__ __forceinline__ float tab1(u16 v) { return h1f(v); }
+
 // One slab's rows [r0, r0 + RPS) of expert e times the activation in shared memory (transposed: column j of chunk c
-// at s_x[j * nch + c], so the lanes of a half-warp read consecutive words).
-template <int K, int G, int LOGK, u32 HASH, int CH, int NW, int RPS, int LPR, typename TAB>
+// at s_x[j * nch + c], so the lanes of a half-warp read consecutive words). Trellis rows store their column groups
+// from the high end (12-bit states, hashed or not); Lloyd-Max rows (LM) are a plain bitstream of K-bit indices into
+// a float32 level table.
+template <bool LM, int K, int G, int LOGK, u32 HASH, int CH, int NW, int RPS, int LPR, typename TAB>
 __device__ __forceinline__ void slab_rows(const float* __restrict__ xs, const u32* __restrict__ codes,
         const u16* __restrict__ scales, const TAB* __restrict__ tab, int ntab, float* __restrict__ yrow,
         long long e, int r0, int m, int n, unsigned char* smem) {
@@ -60,7 +65,7 @@ __device__ __forceinline__ void slab_rows(const float* __restrict__ xs, const u3
         float xr[CH];
         #pragma unroll
         for (int j = 0; j < CH; j++) xr[j] = s_x[j * nch + c];
-        const int wb = (n - CH * (c + 1)) * K / 32;
+        const int wb = LM ? c * (CH * K / 32) : (n - CH * (c + 1)) * K / 32;
         #pragma unroll
         for (int r = 0; r < RPS; r++) {
             const u32* p = ebase + (long long)min(r0 + r, m - 1) * wpr + wb;
@@ -71,13 +76,13 @@ __device__ __forceinline__ void slab_rows(const float* __restrict__ xs, const u3
             float a = 0.f;
             #pragma unroll
             for (int gi = 0; gi < CH / G; gi++) {
-                const int bit = (CH - (gi + 1) * G) * K;
+                const int bit = LM ? gi * K : (CH - (gi + 1) * G) * K;
                 const u64 two = ((u64)w[bit / 32 + 1] << 32) | w[bit / 32];
-                const u32 st = (u32)(two >> (bit % 32)) & 4095u;
+                const u32 st = (u32)(two >> (bit % 32)) & (LM ? (1u << K) - 1u : 4095u);
                 const u32 idx = HASH ? (st * HASH) >> (32 - LOGK) : st;
                 const TAB v = s_tab[idx];
                 if constexpr (G == 1) {
-                    a += h1f((u16)v) * xr[gi];
+                    a += tab1(v) * xr[gi];
                 } else if constexpr (G == 2) {
                     a += h2f_lo((u32)v) * xr[2 * gi] + h2f_hi((u32)v) * xr[2 * gi + 1];
                 } else {
@@ -161,7 +166,7 @@ class MoESideCUDA:
             tt = _TAB_TYPE[g]
             tab_bytes = max(tab_bytes, table.numel() * table.element_size())
             self.args += [codes, scales, table, table.numel()]
-            cases.append(f"case {j}: slab_rows<{k}, {g}, {logk}, {hm}u, {CH}, {nw}, ROWS_PER_HW, LANES_PER_ROW, {tt}>(xs, (const u32*)C{j}, "
+            cases.append(f"case {j}: slab_rows<false, {k}, {g}, {logk}, {hm}u, {CH}, {nw}, ROWS_PER_HW, LANES_PER_ROW, {tt}>(xs, (const u32*)C{j}, "
                          f"(const u16*)S{j}, (const {tt}*)T{j}, N{j}, yrow, e, r0, m, n, smem); break;")
         params = ", ".join(f"const void* C{j}, const void* S{j}, const void* T{j}, int N{j}" for j in range(len(slabs)))
         self.has_nv = nvfp4 is not None
