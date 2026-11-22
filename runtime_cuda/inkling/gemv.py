@@ -331,11 +331,11 @@ class MoESideGEMV:
         self.nslab = len(slabs)
         if not self.has_nv:
             self.nv = [self.ptrs[0], self.ptrs[1], self.ptrs[1], self.ptrs[1], self.ptrs[1]]
-        self.cuda_c = None  # the experimental CUDA C decode kernel (moe_cuda.py), trellis-only sides
+        self.cuda_c = None  # the experimental CUDA C decode kernel (moe_cuda.py)
         from . import moe_cuda
 
-        if moe_cuda.enabled() and slabs and not self.has_nv:
-            self.cuda_c = moe_cuda.MoESideCUDA(slabs, self.slab_of, self.loc_of, m, n)
+        if moe_cuda.enabled():
+            self.cuda_c = moe_cuda.MoESideCUDA(slabs, self.slab_of, self.loc_of, m, n, nvfp4=nvfp4)
 
     def __call__(self, x: torch.Tensor, eids: torch.Tensor, x_div: int, out: torch.Tensor | None = None,
                  x_raw: torch.Tensor | None = None) -> torch.Tensor:
@@ -346,7 +346,7 @@ class MoESideGEMV:
             assert x_raw is not None, "this side has NVFP4 experts: pass x_raw (the unrotated activation)"
         xr = x_raw if x_raw is not None else x
         if self.cuda_c is not None:
-            return self.cuda_c(x, eids, x_div, out=y)
+            return self.cuda_c(x, eids, x_div, out=y, x_raw=x_raw)
         with torch.cuda.device(x.device):
             _moe_gemv_kernel[(triton.cdiv(self.m, self.BLOCK_M), S)](
                 x, eids, self.slab_of, self.loc_of, y, *self.ptrs, xr, *self.nv, xr.stride(0),

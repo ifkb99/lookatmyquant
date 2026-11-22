@@ -77,3 +77,33 @@ def test_moe_side_cuda_graph():
     g.replay()
     want = torch.stack([x[i].double() @ W[int(e)].T for i, e in enumerate(eids.tolist())])
     assert ((out.double() - want).norm() / want.norm()).item() < 1e-5
+
+
+@pytest.mark.parametrize("trellis", [[], ["ht2"], ["ht2", "ht3", "rtr4"]])
+@pytest.mark.parametrize("m,n,x_div", [(2304, 2304, 8), (2304, 1152, 1)])
+def test_moe_side_cuda_nvfp4(trellis, m, n, x_div):
+    """NVFP4 experts (slab 4, the unrotated activation) alone or mixed with trellis slabs in one launch."""
+    from runtime_cuda.inkling.formats import decode_nvfp4
+    from runtime_cuda.inkling.moe_cuda import NV_SLAB, MoESideCUDA
+    from runtime_cuda.test_kernels import _rand_nvfp4
+
+    rng = np.random.default_rng(77 + len(trellis) + n)
+    E = 12
+    if trellis:
+        slabs, slab_of, loc_of, W = _side(rng, trellis, m, n, E)
+    else:
+        slabs, slab_of, loc_of, W = [], torch.zeros(E, dtype=torch.int32, device=DEV), torch.zeros(E, dtype=torch.int32, device=DEV), {}
+    nv = [e for e in range(E) if e % 2 == 1 or not trellis]  # every other expert is NVFP4
+    nc, ns, no = _rand_nvfp4(rng, len(nv), m, n)
+    Wnv = decode_nvfp4(nc, ns, no).double()
+    for loc, e in enumerate(nv):
+        slab_of[e], loc_of[e], W[e] = NV_SLAB, loc, Wnv[loc]
+    side = MoESideCUDA(slabs, slab_of, loc_of, m, n, nvfp4=(nc, ns, no))
+    eids = torch.from_numpy(rng.integers(0, E, size=16)).to(DEV)
+    eids[:4] = torch.arange(4, device=DEV)  # trellis and NVFP4 experts both run
+    x_rot, x_raw = torch.randn(16 // x_div, n, device=DEV), torch.randn(16 // x_div, n, device=DEV)
+    out = torch.full((16, m), float("nan"), device=DEV)
+    side(x_rot, eids, x_div, out=out, x_raw=x_raw)
+    want = torch.stack([(x_raw if int(slab_of[e]) == NV_SLAB else x_rot)[i // x_div].double() @ W[int(e)].T
+                        for i, e in enumerate(eids.tolist())])
+    assert ((out.double() - want).norm() / want.norm()).item() < 1e-5

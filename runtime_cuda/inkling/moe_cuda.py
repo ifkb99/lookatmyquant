@@ -5,7 +5,8 @@ its expert's rows in that expert's format. The difference is where the codebook 
 slab's table (and the activation) into shared memory, which Triton cannot do, so the random table lookups hit
 shared memory instead of gathering through L1. A half-warp owns `RPS` rows; its lanes stride over the row's chunks
 and reduce with shuffles. The source is generated per side (format constants baked in, like Triton constexprs) and
-compiled with NVRTC (`nvrtc.py`). NVFP4 experts are not handled: a side that has them stays on Triton.
+compiled with NVRTC (`nvrtc.py`). NVFP4 experts (slab 4) read the unrotated activation and keep their two small
+tables (E2M1 values, E4M3 block scales) in shared memory the same way.
 """
 from __future__ import annotations
 
@@ -101,14 +102,60 @@ __device__ __forceinline__ void slab_rows(const float* __restrict__ xs, const u3
 }
 """
 
+_NVFP4 = r"""
+// NVFP4 expert e: 16-column blocks of two code words (8 E2M1 nibbles each, low nibble first) and one E4M3 scale byte;
+// the expert's fp32 outer scale at the end. `xs` is the unrotated activation.
+template <int RPS, int LPR>
+__device__ __forceinline__ void nvfp4_rows(const float* __restrict__ xs, const u32* __restrict__ codes,
+        const unsigned char* __restrict__ bscale, const float* __restrict__ outer, const float* __restrict__ e2m1,
+        const float* __restrict__ e4m3, float* __restrict__ yrow, long long e, int r0, int m, int n, unsigned char* smem) {
+    float* s_e2m1 = reinterpret_cast<float*>(smem);
+    float* s_e4m3 = s_e2m1 + 16;
+    float* s_x = reinterpret_cast<float*>(smem + TAB_BYTES);
+    const int nch = n / 16, wpr = n / 8;
+    for (int i = threadIdx.x; i < 16 + 256; i += blockDim.x) s_e2m1[i] = i < 16 ? e2m1[i] : e4m3[i - 16];
+    for (int i = threadIdx.x; i < n; i += blockDim.x) s_x[(i % 16) * nch + i / 16] = xs[i];
+    __syncthreads();
+    const int hl = threadIdx.x % LPR;
+    float acc[RPS];
+    #pragma unroll
+    for (int r = 0; r < RPS; r++) acc[r] = 0.f;
+    for (int c = hl; c < nch; c += LPR) {
+        float xr[16];
+        #pragma unroll
+        for (int j = 0; j < 16; j++) xr[j] = s_x[j * nch + c];
+        #pragma unroll
+        for (int r = 0; r < RPS; r++) {
+            const long long row = e * m + min(r0 + r, m - 1);
+            const uint2 w = __ldg(reinterpret_cast<const uint2*>(codes + row * wpr) + c);
+            float a = 0.f;
+            #pragma unroll
+            for (int j = 0; j < 8; j++) a += s_e2m1[(w.x >> (4 * j)) & 15u] * xr[j] + s_e2m1[(w.y >> (4 * j)) & 15u] * xr[8 + j];
+            acc[r] += a * s_e4m3[__ldg(bscale + row * nch + c)];
+        }
+    }
+    const float o = outer[e];
+    #pragma unroll
+    for (int r = 0; r < RPS; r++) {
+        float s = acc[r];
+        #pragma unroll
+        for (int d = LPR / 2; d > 0; d >>= 1) s += __shfl_xor_sync(0xffffffffu, s, d);
+        if (hl == 0 && r0 + r < m) yrow[r0 + r] = s * o;
+    }
+}
+"""
+
 _TAB_TYPE = {1: "u16", 2: "u32", 4: "u64"}
+NV_SLAB = 4  # as gemv.MoESideGEMV.NV_SLAB
 
 
 class MoESideCUDA:
-    """Decode (one slot per token-expert pair) for the trellis slabs of a `gemv.MoESideGEMV`."""
+    """Decode (one slot per token-expert pair) for the slabs of a `gemv.MoESideGEMV`: trellis `slabs` and optional
+    `nvfp4` = (codes [E, m, n/2] uint8, block scales [E, m, n/16] uint8, outer [E] float32)."""
 
-    def __init__(self, slabs, slab_of: torch.Tensor, loc_of: torch.Tensor, m: int, n: int, rps: int = 4, lpr: int = 16):
-        assert 1 <= len(slabs) <= 4
+    def __init__(self, slabs, slab_of: torch.Tensor, loc_of: torch.Tensor, m: int, n: int, rps: int = 4, lpr: int = 16,
+                 nvfp4=None):
+        assert len(slabs) <= 4 and (slabs or nvfp4 is not None)
         self.m, self.n, self.rps, self.lpr, self._slabs = m, n, rps, lpr, slabs
         self.slab_of, self.loc_of = slab_of, loc_of
         self.args, cases, tab_bytes = [], [], 0
@@ -120,10 +167,23 @@ class MoESideCUDA:
             self.args += [codes, scales, table, table.numel()]
             cases.append(f"case {j}: slab_rows<{k}, {g}, {logk}, {hm}u, {CH}, {nw}, ROWS_PER_HW, LANES_PER_ROW, {tt}>(xs, (const u32*)C{j}, "
                          f"(const u16*)S{j}, (const {tt}*)T{j}, N{j}, yrow, e, r0, m, n, smem); break;")
-        self.smem = tab_bytes + n * 4
         params = ", ".join(f"const void* C{j}, const void* S{j}, const void* T{j}, int N{j}" for j in range(len(slabs)))
-        src = (f"#define TAB_BYTES {tab_bytes}\n#define ROWS_PER_HW {rps}\n#define LANES_PER_ROW {lpr}\n" + _PRELUDE + f"""
+        self.has_nv = nvfp4 is not None
+        if self.has_nv:
+            from .formats import nvfp4_tables
+
+            assert n % 16 == 0, n
+            nc, nsb, nout = nvfp4
+            self.args += [nc.contiguous(), nsb.contiguous(), nout.float().contiguous(), *nvfp4_tables(nc.device)]
+            params += (", " if params else "") + "const void* CN, const void* SN, const void* ON, const void* E2, const void* E4"
+            tab_bytes = max(tab_bytes, (16 + 256) * 4)
+            cases.append(f"case {NV_SLAB}: nvfp4_rows<ROWS_PER_HW, LANES_PER_ROW>(xr, (const u32*)CN, (const unsigned char*)SN, "
+                         "(const float*)ON, (const float*)E2, (const float*)E4, yrow, e, r0, m, n, smem); break;")
+        self.smem = tab_bytes + n * 4
+        src = (f"#define TAB_BYTES {tab_bytes}\n#define ROWS_PER_HW {rps}\n#define LANES_PER_ROW {lpr}\n" + _PRELUDE
+               + (_NVFP4 if self.has_nv else "") + f"""
 extern "C" __global__ void __launch_bounds__({THREADS}) moe_side(const float* __restrict__ x, int x_div, int stride_x,
+        const float* __restrict__ x_raw, int stride_xr,
         const void* __restrict__ eids, int eid64, const int* __restrict__ slab_of, const int* __restrict__ loc_of,
         float* __restrict__ y, int stride_y, int m, int n, {params}) {{
     extern __shared__ __align__(16) unsigned char smem[];
@@ -132,6 +192,7 @@ extern "C" __global__ void __launch_bounds__({THREADS}) moe_side(const float* __
     const int r0 = blockIdx.x * ({THREADS} / LANES_PER_ROW) * ROWS_PER_HW + (threadIdx.x / LANES_PER_ROW) * ROWS_PER_HW;
     float* yrow = y + (long long)slot * stride_y;
     const float* xs = x + (long long)(slot / x_div) * stride_x;
+    const float* xr = x_raw + (long long)(slot / x_div) * stride_xr;  // NVFP4 experts: the unrotated activation
     const long long e = loc_of[eid];
     switch (slab_of[eid]) {{
         {chr(10).join(cases)}
@@ -142,12 +203,18 @@ extern "C" __global__ void __launch_bounds__({THREADS}) moe_side(const float* __
         self.kernel = Kernel(src, "moe_side", slab_of.device, smem=self.smem)
         self.rows_per_block = (THREADS // lpr) * rps
 
-    def __call__(self, x: torch.Tensor, eids: torch.Tensor, x_div: int, out: torch.Tensor | None = None) -> torch.Tensor:
+    def __call__(self, x: torch.Tensor, eids: torch.Tensor, x_div: int, out: torch.Tensor | None = None,
+                 x_raw: torch.Tensor | None = None) -> torch.Tensor:
+        """`x` the rotated activation (trellis experts), `x_raw` the unrotated one (NVFP4 experts)."""
         S = eids.numel()
-        assert x.dtype == torch.float32 and x.stride(-1) == 1, (x.dtype, x.stride())
+        if self.has_nv:
+            assert x_raw is not None, "this side has NVFP4 experts: pass x_raw (the unrotated activation)"
+        xr = x_raw if x_raw is not None else x
+        for t in (x, xr):
+            assert t.dtype == torch.float32 and t.stride(-1) == 1, (t.dtype, t.stride())
         assert eids.dtype in (torch.int32, torch.int64), eids.dtype
         y = out if out is not None else torch.empty(S, self.m, dtype=torch.float32, device=x.device)
         grid = ((self.m + self.rows_per_block - 1) // self.rows_per_block, S)
-        self.kernel(grid, (THREADS,), [x, x_div, x.stride(0), eids, int(eids.dtype == torch.int64), self.slab_of, self.loc_of, y, y.stride(0),
+        self.kernel(grid, (THREADS,), [x, x_div, x.stride(0), xr, xr.stride(0), eids, int(eids.dtype == torch.int64), self.slab_of, self.loc_of, y, y.stride(0),
                                        self.m, self.n, *self.args], self.smem)
         return y
