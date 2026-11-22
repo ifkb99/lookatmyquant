@@ -246,6 +246,10 @@ def gate_mul(attn, gate_raw):
 
 @_fused
 def route_top8(h, router_w, router_bias, k: int, route_scale: float):
+    if h.is_cuda and h.shape[0] <= 16 and router_w.dtype == torch.float32 and router_w.is_contiguous():
+        from .fused import route_top8_fused  # decode and verify-sized batches: 2 launches instead of ~5
+
+        return route_top8_fused(h, router_w, router_bias.float().contiguous(), k, route_scale)
     scores = torch.sigmoid(h.float() @ router_w.T)
     idx = torch.topk(scores + router_bias, k, dim=-1, sorted=False).indices
     w = scores.gather(1, idx)

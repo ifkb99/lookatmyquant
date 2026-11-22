@@ -158,7 +158,7 @@ class MoESideCUDA:
                  groups: int = 1,
                  nvfp4=None):
         assert len(slabs) <= 4 and (slabs or nvfp4 is not None)
-        self.m, self.n, self.rps, self.lpr, self._slabs = m, n, rps, lpr, slabs
+        self.m, self.n, self.rps, self.lpr, self._slabs, self._nvfp4 = m, n, rps, lpr, slabs, nvfp4
         assert m % groups == 0, (m, groups)
         self.groups = groups
         self.slab_of, self.loc_of = slab_of, loc_of
