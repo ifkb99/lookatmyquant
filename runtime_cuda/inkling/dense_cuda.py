@@ -1,4 +1,4 @@
-"""CUDA C decode GEMV for a stage of packed matrices (experimental; `LAMQ_CUDA_C=1`), the counterpart of
+"""CUDA C decode GEMV for a stage of packed matrices (on by default in this fork; `LAMQ_CUDA_C=0` for Triton), the counterpart of
 `gemv.DenseStageGEMV`: up to 8 matrices of any formats (trellis or Lloyd-Max) that share an input width, one
 launch. The grid's row blocks are split across the matrices; a block copies its matrix's table and input row into
 shared memory and runs `moe_cuda`'s `slab_rows` (the attention inputs, the LM head, a single linear).

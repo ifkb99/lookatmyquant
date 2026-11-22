@@ -19,8 +19,11 @@ _libs: dict[str, ctypes.CDLL] = {}
 
 
 def enabled() -> bool:
-    """The experimental CUDA C kernels are on (`LAMQ_CUDA_C=1`); Triton is the default."""
-    return os.environ.get("LAMQ_CUDA_C", "0") not in ("", "0")
+    """The CUDA C kernels are on unless `LAMQ_CUDA_C=0` (this fork's default, tuned on RTX A4500s; upstream runs
+    Triton only)."""
+    return os.environ.get("LAMQ_CUDA_C", "1") not in ("", "0")
+
+
 _modules: dict[tuple, tuple] = {}  # (source, device index, options) -> (module, cubin): one compile each
 
 

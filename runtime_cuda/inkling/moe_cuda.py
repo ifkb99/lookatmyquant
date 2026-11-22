@@ -1,4 +1,4 @@
-"""CUDA C decode GEMV for one MoE side (experimental; `LAMQ_CUDA_C=1` turns it on, Triton stays the default).
+"""CUDA C decode GEMV for one MoE side (on by default in this fork; `LAMQ_CUDA_C=0` runs Triton).
 
 The same job as `gemv._moe_gemv_kernel` for trellis experts: every (row block, token-expert slot) block decodes
 its expert's rows in that expert's format. The difference is where the codebook lives: each block copies its
