@@ -15,7 +15,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .formats import EXPERT_FIDS, FMT_PARAMS, ID_TO_FMT, NVFP4_FID
+from ..format_metadata import E2M1, EXPERT_FIDS, FMT_PARAMS, NVFP4_FID, e4m3_table_np
 
 LM_FMTS = ("lm6", "lm8")
 LINEAR_FMTS = set(FMT_PARAMS) | set(LM_FMTS)
@@ -40,7 +40,7 @@ def _layer_key_ok(key: str) -> bool:
     m = re.fullmatch(r"lin_(\w+?)_(codes|scales|signs_in|signs_out|levels)", key)
     if m:
         return True
-    if key in ("gu_signs_in", "dn_signs_in", "gu_map", "dn_map"):
+    if key in ("gu_signs_in", "dn_signs_in", "gu_map", "dn_map", "gu_rg_map", "dn_rg_map"):
         return True
     m = re.fullmatch(r"(gu|dn)_(\w+)_(codes|scales|outer)", key)
     if m:
@@ -49,7 +49,7 @@ def _layer_key_ok(key: str) -> bool:
     return False
 
 
-def check_layer(path: Path, meta: dict, arrays=None) -> None:
+def check_layer(path: Path, meta: dict, arrays=None) -> list[str]:
     """One layer: its tensors, linear formats and expert format ids. `arrays` (an open npz) enables the map check."""
     name = path.name
     keys = _npz_keys(path)
@@ -70,17 +70,36 @@ def check_layer(path: Path, meta: dict, arrays=None) -> None:
         if bad:
             raise UnsupportedPackedFile(f"{name}: experts ({side}) use unknown formats {sorted(bad)}")
         if arrays is not None:
-            emap = np.asarray(arrays[f"{side}_map"])
-            for fid in np.unique(emap[:, 0]).tolist():
+            legacy, grouped = f"{side}_map", f"{side}_rg_map"
+            if (legacy in keys) == (grouped in keys):
+                raise UnsupportedPackedFile(f"{name}: expected exactly one {side} expert map")
+            key = grouped if grouped in keys else legacy
+            emap = np.asarray(arrays[key])
+            if emap.ndim != (3 if key == grouped else 2) or emap.shape[-1] != 2 or not emap.size:
+                raise UnsupportedPackedFile(f"{name}: invalid shape for {key}: {emap.shape}")
+            pairs = emap.reshape(-1, 2)
+            for fid in np.unique(pairs[:, 0]).tolist():
                 if fid not in EXPERT_FIDS:
                     raise UnsupportedPackedFile(f"{name}: {side} experts use unknown format id {fid}")
+                if key == grouped and fid == NVFP4_FID:
+                    raise UnsupportedPackedFile(f"{name}: row-group NVFP4 experts are unsupported")
                 fmt = EXPERT_FIDS[fid]
-                if f"{side}_{fmt}_codes" not in keys:
-                    raise UnsupportedPackedFile(f"{name}: {side} map names format {fmt} (id {fid}) but has no {side}_{fmt}_codes")
-                n_slab = arrays[f"{side}_{fmt}_codes"].shape[0]
-                locs = emap[emap[:, 0] == fid, 1]
-                if locs.max() >= n_slab or locs.min() < 0:
-                    raise UnsupportedPackedFile(f"{name}: {side} {fmt} expert index out of range ({locs.max()} >= {n_slab})")
+                codes = f"{side}_{fmt}_codes"
+                if codes not in keys:
+                    raise UnsupportedPackedFile(f"{name}: {key} references missing {codes}")
+                with zipfile.ZipFile(path) as archive, archive.open(f"{codes}.npy") as handle:
+                    version = np.lib.format.read_magic(handle)
+                    if version == (1, 0):
+                        shape, _, _ = np.lib.format.read_array_header_1_0(handle)
+                    elif version in ((2, 0), (3, 0)):
+                        # Pack arrays use simple ASCII numeric dtype descriptors. NPY 3 changes only the encoding.
+                        shape, _, _ = np.lib.format.read_array_header_2_0(handle)
+                    else:
+                        raise UnsupportedPackedFile(f"{name}: {codes} uses unknown NPY version {version}")
+                locs = pairs[pairs[:, 0] == fid, 1]
+                if locs.max() >= shape[0] or locs.min() < 0:
+                    raise UnsupportedPackedFile(f"{name}: {side} {fmt} index outside the slab")
+    return keys
 
 
 def check_buckets(path: Path, meta: list[dict]) -> None:
@@ -94,14 +113,16 @@ def check_buckets(path: Path, meta: list[dict]) -> None:
         raise UnsupportedPackedFile(f"{path.name}: unknown tensors {unknown[:6]}")
 
 
-def check_config(cfg_path: Path) -> None:
+def check_config(cfg_path: Path) -> int:
     raw = json.loads(cfg_path.read_text())
     tc = raw.get("text_config", raw)
     if tc.get("n_shared_experts", 0):
         raise UnsupportedPackedFile(f"config: n_shared_experts={tc['n_shared_experts']} is not implemented")
     if tc.get("loop_config", {}).get("is_varloop", False):
         raise UnsupportedPackedFile("config: loop_config.is_varloop is not implemented")
-    n = tc.get("num_hidden_layers", 0)
+    n = tc.get("num_hidden_layers")
+    if type(n) is not int or n < 1:
+        raise UnsupportedPackedFile("config: num_hidden_layers must be a positive integer")
     local = set(tc.get("local_layer_ids", []))
     types = tc.get("layer_types") or ["hybrid" if (i + 1) % 6 == 0 else "hybrid_sliding" for i in range(n)]  # transformers' default
     if {i for i, t in enumerate(types) if t.endswith("sliding")} != local:  # the runtimes read local_layer_ids
@@ -114,13 +135,23 @@ def check_config(cfg_path: Path) -> None:
     for swa, full in (("swa_num_attention_heads", "num_attention_heads"), ("swa_num_key_value_heads", "num_key_value_heads"), ("swa_head_dim", "head_dim")):
         if swa in tc and tc[swa] != tc[full]:  # the runtime gives sliding layers the full layers' head shape
             raise UnsupportedPackedFile(f"config: {swa}={tc[swa]} differs from {full}={tc[full]}, which is not implemented")
+    return n
 
 
 def validate_packed_dir(packed_dir: str | Path, deep: bool = True) -> dict:
     """Raises UnsupportedPackedFile on anything unknown. `deep` also opens each layer's expert maps (cheap: two
     small arrays a layer). Returns a summary of the formats the file uses."""
     d = Path(packed_dir)
-    check_config(d / "config.json")
+    n_layers = check_config(d / "config.json")
+    layer_stems = [f"layer_{index:02d}" for index in range(n_layers)]
+    for suffix in ("_packed.npz", "_meta.json"):
+        expected = {stem + suffix for stem in layer_stems}
+        actual = {path.name for path in d.glob(f"layer_*{suffix}") if path.is_file()}
+        if expected != actual:
+            raise UnsupportedPackedFile(
+                f"invalid layer files for {suffix}: missing {sorted(expected - actual)}, "
+                f"unexpected {sorted(actual - expected)}"
+            )
     man = d / "manifest.json"
     if man.exists():
         fmt = json.loads(man.read_text()).get("format", "")
@@ -137,26 +168,28 @@ def validate_packed_dir(packed_dir: str | Path, deep: bool = True) -> dict:
     if luts - LUT_NAMES:
         raise UnsupportedPackedFile(f"luts.npz: unknown tables {sorted(luts - LUT_NAMES)}")
     if luts & {"nvfp4_e2m1", "nvfp4_e4m3"}:  # upstream reads these when present; the kernels use formats.py's tables
-        from .formats import E2M1, e4m3_table_np
-
         lz = np.load(d / "luts.npz")
         if "nvfp4_e2m1" in luts and not np.array_equal(lz["nvfp4_e2m1"].astype(np.float32).reshape(-1), np.array(E2M1, np.float32)):
             raise UnsupportedPackedFile("luts.npz: nvfp4_e2m1 differs from the standard E2M1 table")
         if "nvfp4_e4m3" in luts and not np.array_equal(lz["nvfp4_e4m3"].astype(np.float32).reshape(-1), e4m3_table_np()):
             raise UnsupportedPackedFile("luts.npz: nvfp4_e4m3 differs from the standard E4M3 table")
     used: dict[str, int] = {}
-    n_layers = json.loads((d / "config.json").read_text()).get("text_config", {}).get("num_hidden_layers")
-    for p in sorted(d.glob("layer_*_packed.npz")):
-        meta = json.loads(p.with_name(p.name.replace("_packed.npz", "_meta.json")).read_text())
-        arrays = np.load(p) if deep else None
-        check_layer(p, meta, arrays)
+    for stem in layer_stems:
+        p = d / f"{stem}_packed.npz"
+        meta = json.loads((d / f"{stem}_meta.json").read_text())
+        if deep:
+            with np.load(p) as arrays:
+                keys = check_layer(p, meta, arrays)
+        else:
+            keys = check_layer(p, meta)
+        for side in ("gu", "dn"):
+            if f"{side}_nvfp4_codes" in keys:
+                used.setdefault("experts:nvfp4", 0)
         for lm in meta["linears"].values():
             used[lm["fmt"]] = used.get(lm["fmt"], 0) + 1
         for side in ("gu", "dn"):
             for f, c in meta.get("experts", {}).get(side, {}).items():
                 used[f"experts:{f}"] = used.get(f"experts:{f}", 0) + c
-    if n_layers is not None and len(list(d.glob("layer_*_packed.npz"))) != n_layers:
-        raise UnsupportedPackedFile(f"expected {n_layers} layer files, found {len(list(d.glob('layer_*_packed.npz')))}")
     for kind in ("embed", "head"):
         meta = json.loads((d / f"{kind}_meta.json").read_text())
         check_buckets(d / f"{kind}_packed.npz", meta)

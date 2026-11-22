@@ -8,12 +8,14 @@ import numpy as np
 import pytest
 import torch
 
+if not torch.cuda.is_available():
+    pytest.skip("CUDA device required", allow_module_level=True)
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from runtime_cuda.inkling.formats import FMT_PARAMS, decode_lm, decode_trellis  # noqa: E402
 from runtime_cuda.inkling.triton_kernels import group_by_expert, packed_matmul  # noqa: E402
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 DEV = torch.device("cuda")
 
 
@@ -137,23 +139,27 @@ def test_gemv_x_div():
     assert ((got - want).norm() / want.norm()).item() < 1e-5
 
 
-def test_moe_side_gemv_mixed_formats():
+@pytest.mark.parametrize("groups", [1, 2, 18])
+def test_moe_side_gemv_mixed_formats(groups):
     from runtime_cuda.inkling.gemv import MoESideGEMV
 
     rng = np.random.default_rng(9)
-    m, n, E = 256, 1152, 12
+    group_rows, n, E = 128, 1152, 12
+    m = group_rows * groups
     fmts = ["ht2", "ht3", "rtr4"]
-    owner = rng.integers(0, 3, size=E)
-    slabs, W = [], {}
-    slab_of, loc_of = np.zeros(E, np.int32), np.zeros(E, np.int32)
+    entries = E * groups
+    owner = rng.integers(0, len(fmts), size=entries)
+    slabs, weights = [], {}
+    slab_of, loc_of = np.zeros(entries, np.int32), np.zeros(entries, np.int32)
     for j, fmt in enumerate(fmts):
         ids = np.nonzero(owner == j)[0]
-        codes, scales, lut = _rand_trellis(rng, max(1, len(ids)), m, n, fmt)
+        codes, scales, lut = _rand_trellis(rng, max(1, len(ids)), group_rows, n, fmt)
         slabs.append((fmt, codes, scales, lut))
-        Wf = decode_trellis(codes, scales, lut, n, fmt)
-        for loc, e in enumerate(ids):
-            slab_of[e], loc_of[e], W[int(e)] = j, loc, Wf[loc]
-    side = MoESideGEMV(slabs, torch.from_numpy(slab_of).to(DEV), torch.from_numpy(loc_of).to(DEV), m, n)
+        decoded = decode_trellis(codes, scales, lut, n, fmt)
+        for loc, entry in enumerate(ids):
+            slab_of[entry], loc_of[entry], weights[int(entry)] = j, loc, decoded[loc]
+    W = [torch.cat([weights[e * groups + group] for group in range(groups)]) for e in range(E)]
+    side = MoESideGEMV(slabs, torch.from_numpy(slab_of).to(DEV), torch.from_numpy(loc_of).to(DEV), m, n, groups=groups)
     eids = torch.from_numpy(rng.integers(0, E, size=16)).to(DEV)
     x = torch.randn(2, n, device=DEV)
     got = side(x, eids, x_div=8)

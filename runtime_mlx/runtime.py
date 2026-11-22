@@ -1,9 +1,10 @@
 """High-level Apple Silicon MLX runtime API for LookAtMyQuant models.
 
-Supports both packed formats (`opgraph-packed-1` via `artifact.json`, including
-Qwen3.5-4B and Qwen3.8-27B with or without a DSpine drafter, and `lamq.json`
-exports such as Gemma 4 E2B) from either a local directory or a Hugging Face
-repository ID.
+Supports all packed formats (`opgraph-packed-1` via `artifact.json`, including
+Qwen3.5-4B and Qwen3.8-27B with or without a DSpine drafter, `inkling2-packed`
+via `manifest.json` for Inkling-2-Mini 3.9GB–12.8GB with or without a 4-bit
+DSpark drafter, and `lamq.json` exports such as Gemma 4 E2B) from either a
+local directory or a Hugging Face repository ID.
 
 Drop-in `mlx_lm` integration:
 
@@ -28,9 +29,10 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import Any
 
 
 @dataclass
@@ -119,7 +121,9 @@ def inspect_model(path_or_repo: str | Path) -> dict[str, Any]:
         manifest = json.loads((directory / "manifest.json").read_text())
         info["manifest_format"] = manifest.get("format")
         info["packed_bytes"] = sum(
-            f.stat().st_size for f in directory.iterdir() if f.is_file() and f.name != "README.md"
+            f.stat().st_size
+            for f in directory.iterdir()
+            if f.is_file() and f.name != "README.md"
         )
         info["packed_text_gb"] = manifest.get("packed_text_gb")
         info["n_routed_experts"] = text_cfg.get("n_routed_experts")
@@ -161,7 +165,11 @@ def load(
 
     model, tokenizer = lamq_model.load(directory)
     if fastpath:
-        tm = model.language_model.model if hasattr(model, "language_model") else getattr(model, "model", None)
+        tm = (
+            model.language_model.model
+            if hasattr(model, "language_model")
+            else getattr(model, "model", None)
+        )
         layers = getattr(tm, "layers", None)
         if layers and hasattr(layers[0], "per_layer_input_gate"):
             from . import fastpath as lamq_fastpath
@@ -312,7 +320,7 @@ class Runtime:
         drafter_int8: bool = True,
         select: bool = False,
         full_vocab: bool = False,
-    ) -> "Runtime":
+    ) -> Runtime:
         """Load a quantized model and, optionally, a paired DSpine drafter."""
         model_path = resolve_path(model)
         fmt = detect_format(model_path)
@@ -349,12 +357,17 @@ class Runtime:
                 f"speculative drafting requires an opgraph-packed-1 or inkling2-packed model, got {fmt}"
             )
         import mlx.core as mx
+
         from . import block_q35, draft_vocab_q35, drafter_q35, fast_q35
 
         drafter_path = resolve_path(drafter)
         m, tok = fast_q35.load(model_path, kind=kind, verify=verify, fuse=fuse)
         blk = block_q35.Block(m, tap_layers=drafter_q35.drafter_taps(drafter_path))
-        dtype = getattr(mx, drafter_dtype) if isinstance(drafter_dtype, str) else drafter_dtype
+        dtype = (
+            getattr(mx, drafter_dtype)
+            if isinstance(drafter_dtype, str)
+            else drafter_dtype
+        )
         draft = drafter_q35.Drafter(
             drafter_path,
             blk,
@@ -410,6 +423,7 @@ class Runtime:
         block_size: int = 8,
         use_drafter: bool = True,
         adaptive: bool = True,
+        prefill_chunk: int | None = -1,
     ) -> Iterator[Chunk]:
         """Stream generated chunks for pre-encoded prompt token IDs."""
         ids = _unwrap_ids(prompt_ids)
@@ -438,6 +452,7 @@ class Runtime:
                     temp=temp,
                     top_p=top_p,
                     stats_out=stats,
+                    prefill_chunk=prefill_chunk,
                 )
             else:
                 gen = stream_serial(
@@ -448,6 +463,7 @@ class Runtime:
                     temp=temp,
                     top_p=top_p,
                     stats_out=stats,
+                    prefill_chunk=prefill_chunk,
                 )
             try:
                 for raw_chunk in gen:
@@ -472,7 +488,9 @@ class Runtime:
             finally:
                 gen.close()
             tail = decoder.finalize()
-            prompt_s = float(stats.get("prompt_s", 0.0)) + float(stats.get("drafter_prompt_s", 0.0))
+            prompt_s = float(stats.get("prompt_s", 0.0)) + float(
+                stats.get("drafter_prompt_s", 0.0)
+            )
             rounds_s = float(stats.get("rounds_s", 0.0))
             if rounds_s <= 0.0:
                 rounds_s = max(time.perf_counter() - t_start - prompt_s, 1e-9)
@@ -483,7 +501,9 @@ class Runtime:
                 prompt_tokens=len(ids),
                 generation_tokens=emitted_total,
                 prompt_tps=len(ids) / prompt_s if prompt_s > 0 else 0.0,
-                generation_tps=stats.get("tokens", emitted_total) / rounds_s if rounds_s > 0 else 0.0,
+                generation_tps=stats.get("tokens", emitted_total) / rounds_s
+                if rounds_s > 0
+                else 0.0,
                 tokens_per_check=stats.get("tokens_per_check"),
                 stats=stats,
             )
@@ -532,7 +552,9 @@ class Runtime:
             finally:
                 gen_q35.close()
             tail = decoder.finalize()
-            prompt_s = float(stats.get("prompt_s", 0.0)) + float(stats.get("drafter_prompt_s", 0.0))
+            prompt_s = float(stats.get("prompt_s", 0.0)) + float(
+                stats.get("drafter_prompt_s", 0.0)
+            )
             rounds_s = float(stats.get("rounds_s", 0.0))
             if rounds_s <= 0.0:
                 rounds_s = max(time.perf_counter() - t_start - prompt_s, 1e-9)
@@ -543,7 +565,9 @@ class Runtime:
                 prompt_tokens=len(ids),
                 generation_tokens=emitted_total,
                 prompt_tps=len(ids) / prompt_s if prompt_s > 0 else 0.0,
-                generation_tps=stats.get("tokens", emitted_total) / rounds_s if rounds_s > 0 else 0.0,
+                generation_tps=stats.get("tokens", emitted_total) / rounds_s
+                if rounds_s > 0
+                else 0.0,
                 tokens_per_check=stats.get("tokens_per_check"),
                 stats=stats,
             )
@@ -586,6 +610,7 @@ class Runtime:
         block_size: int = 8,
         use_drafter: bool = True,
         adaptive: bool = True,
+        prefill_chunk: int | None = -1,
     ) -> Iterator[Chunk]:
         """Encode a prompt and stream output chunks."""
         ids = self.encode_prompt(
@@ -603,6 +628,7 @@ class Runtime:
             block_size=block_size,
             use_drafter=use_drafter,
             adaptive=adaptive,
+            prefill_chunk=prefill_chunk,
         )
 
     def stream_chat(
@@ -617,6 +643,7 @@ class Runtime:
         block_size: int = 8,
         use_drafter: bool = True,
         adaptive: bool = True,
+        prefill_chunk: int | None = -1,
     ) -> Iterator[Chunk]:
         """Encode a chat message list and stream output chunks."""
         ids = self.encode_messages(messages, thinking=thinking)
@@ -629,6 +656,7 @@ class Runtime:
             block_size=block_size,
             use_drafter=use_drafter,
             adaptive=adaptive,
+            prefill_chunk=prefill_chunk,
         )
 
     def _collect(self, chunks: Iterator[Chunk]) -> GenerationResult:
@@ -667,6 +695,7 @@ class Runtime:
         block_size: int = 8,
         use_drafter: bool = True,
         adaptive: bool = True,
+        prefill_chunk: int | None = -1,
     ) -> GenerationResult:
         """Generate a complete response for a prompt string or token IDs."""
         return self._collect(
@@ -682,6 +711,7 @@ class Runtime:
                 block_size=block_size,
                 use_drafter=use_drafter,
                 adaptive=adaptive,
+                prefill_chunk=prefill_chunk,
             )
         )
 
@@ -697,6 +727,7 @@ class Runtime:
         block_size: int = 8,
         use_drafter: bool = True,
         adaptive: bool = True,
+        prefill_chunk: int | None = -1,
     ) -> GenerationResult:
         """Generate a complete response for a list of chat messages."""
         return self._collect(
@@ -710,5 +741,6 @@ class Runtime:
                 block_size=block_size,
                 use_drafter=use_drafter,
                 adaptive=adaptive,
+                prefill_chunk=prefill_chunk,
             )
         )

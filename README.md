@@ -2,13 +2,13 @@
 
 LookAtMyQuant is a quantization compiler. It measures how much each stored piece of a model hurts the output when compressed. It then picks a code for each piece so the whole model fits a size budget with the least damage.
 
-On Gemma 4 E2B, its GGUF has 12× lower KL than Q4_K_M at the same file size. The method and every result are on [the site](https://lookatmyquant.pages.dev).
+On Gemma 4 E2B, its GGUF has 12× lower KL than Q4_K_M at the same file size. The method and every result are on [the site](https://lookatmyquant.pages.dev/compiler/).
 
 The code is under the MIT license.
 
 ## LookAtMyQuant 2: Qwen3.5-4B in 1.2 GB
 
-[LookAtMyQuant 2](https://lookatmyquant2.pages.dev) takes Qwen3.5-4B to 1.23 GB, 2.3 bits per weight. The file solves 330 of 540 exact-answer math problems. Prism ML's Bonsai 2 Ternary 4B solves 328 at 1.20 GB, and the original solves 359. Its KL from the original on held-out text is 0.45 nats, against 0.59 for Bonsai.
+[LookAtMyQuant 2](https://lookatmyquant.pages.dev/2/) takes Qwen3.5-4B to 1.23 GB, 2.3 bits per weight. The file solves 330 of 540 exact-answer math problems. Prism ML's Bonsai 2 Ternary 4B solves 328 at 1.20 GB, and the original solves 359. Its KL from the original on held-out text is 0.45 nats, against 0.59 for Bonsai.
 
 The recipe is post-training quantization with trellis codes, calibrated on the model's own worked math solutions with digit tokens weighted 10×, and with bits allocated per row by Fisher information. 4,000 steps of distillation follow, in which every layer is re-quantized once from the original weights. The page has the findings, the full recipe and its cost, about $34 of GPU time.
 
@@ -20,21 +20,25 @@ The same recipe takes Qwen3.8-27B from 53.7 GB to 7.2 GB, 2.1 bits per weight, c
 
 Beside it sits [a 4-bit DSpine drafter](https://huggingface.co/shinmegamiboson/Qwen3.8-27B-LookAtMyQuant-7.2GB-drafter) (1.02 GB, converted from `tencent/Qwen3.8-27B-DSpine-b16` with `runtime_mlx/convert_dspine.py` and packed with `pack_drafter.py`), which roughly doubles decode speed on math and code on Apple silicon.
 
-## Inkling-2-Mini in 5.4 GB, 8.9 GB, 11.2 GB, and 12.8 GB
+## Inkling-2-Mini in 3.9 GB, 4.7 GB, 5.4 GB, 8.9 GB, 11.2 GB, and 12.8 GB
 
-Extended to a 26.4B physical / 5.4B active 3×-looped MoE (`L6–17` looped 3× = 48 logical visits, 128 experts top-8), the compiler and full-MoE proximal fine-tuning (`SQYFR`) compress [`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) from 18.89 GB of text weights into four Apple Silicon MLX builds: **[5.38 GB (`1.65 bpp`)](https://huggingface.co/shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-5.4GB)**, **[8.87 GB (`2.72 bpp`)](https://huggingface.co/shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-8.9GB)**, **[11.18 GB (`3.43 bpp`)](https://huggingface.co/shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-11.2GB)**, and **[12.76 GB (`3.92 bpp`)](https://huggingface.co/shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-12.8GB)** — combining 4 KB SRAM hashed block-vector trellis codes (`ht2`/`ht3`), row trellis codes (`rtr1`/`rtr4`), a `tr2` floor on the tail `lm_head` bucket (`head.7`), and exact native `NVFP4` passthrough (`69/192` and `109/192` highest-sensitivity expert buckets kept at `0.0` error in the `11.2 GB` and `12.8 GB` builds).
+Extended to a 26.4B physical / 5.4B active 3×-looped MoE (`L6–17` looped 3× = 48 logical visits, 128 experts top-8), the compiler and full-MoE proximal fine-tuning (`SQYFR` / `SQYFR v2` / `SQYFR v3`) compress [`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) from 18.89 GB of text weights into six Apple Silicon MLX builds spanning 8 GB iPhones up to lossless teacher parity: **[3.85 GB (`1.18 bpp`)](https://huggingface.co/shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-3.9GB)**, **[4.72 GB (`1.45 bpp`)](https://huggingface.co/shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-4.7GB)**, **[5.38 GB (`1.65 bpp`)](https://huggingface.co/shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-5.4GB)**, **[8.87 GB (`2.72 bpp`)](https://huggingface.co/shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-8.9GB)**, **[11.18 GB (`3.43 bpp`)](https://huggingface.co/shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-11.2GB)**, and **[12.76 GB (`3.92 bpp`)](https://huggingface.co/shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-12.8GB)** — combining 4 KB SRAM hashed block-vector trellis codes (`ht2`/`ht3`), row trellis codes (`rtr1`/`rtr4`), surgical `128`-row-group Fisher outlier allocation (`gu_rg_map`/`dn_rg_map`), dedicated attention projection floors, a `tr2` floor on the tail `lm_head` bucket (`head.7`), and exact native `NVFP4` passthrough (`69/192` and `109/192` highest-sensitivity expert buckets kept at `0.0` error in the `11.2 GB` and `12.8 GB` builds).
 
-Evaluated untruncated (`max_new_tokens = 1,536`, greedy, `reasoning_effort="none"`) on the same BF16 teacher, `openai/gsm8k` (`test[:200]`), all `164` executable `openai/openai_humaneval` problems, `4` Vision VQA tests (with the untouched 637 MB BF16 vision tower), and 16+13-language TextMix windows:
+Evaluated untruncated (`max_new_tokens = 1,536`, greedy, `reasoning_effort="none"`) on the same BF16 teacher, `openai/gsm8k` (`test[:200]`), all `164` executable `openai/openai_humaneval` problems (strict `<|content_text|>` execution across every build), `4` Vision VQA tests (with the untouched 637 MB BF16 vision tower), and 16+13-language TextMix windows:
 
-| Model | Text GB | Text `bpp` | `free_KL` (`en/chat/code`) | `all13_KL` | GSM8K (200) | HumanEval (164) | Vision (4) | 3-Task Mean vs Teacher |
+| Model | Text GB | Text `bpp` | `free_KL` (`en/chat/code`) | `all13_KL` | GSM8K (200) | HumanEval Strict (164) | Vision (4) | 3-Task Mean vs Teacher |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | **Original BF16 Teacher** | 18.89 | 5.80 | 0.0000 | 0.0000 | 193 / 200 (96.5%) | 152 / 164 (92.7%) | 4 / 4 | 100.0% |
 | **[LookAtMyQuant 12.8 GB (`NVFP4` + Trellis)](https://huggingface.co/shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-12.8GB)** | **12.76** | **3.92** | **0.0070** | **0.0268** | **193 / 200 (96.5%)** | **152 / 164 (92.7%)** | **4 / 4** | **100.0%** |
 | **[LookAtMyQuant 11.2 GB (`NVFP4` + Trellis)](https://huggingface.co/shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-11.2GB)** | **11.18** | **3.43** | **0.0115** | **0.0400** | **190 / 200 (95.0%)** | **151 / 164 (92.1%)** | **4 / 4** | **99.3% (98.9% pooled)** |
 | **[LookAtMyQuant 8.9 GB (`SQYFR`)](https://huggingface.co/shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-8.9GB)** | **8.87** | **2.72** | **0.0208** | **0.0571** | **192 / 200 (96.0%)** | **149 / 164 (90.9%)** | **4 / 4** | **99.2% (98.9% pooled)** |
-| **[LookAtMyQuant 5.4 GB (`SQYFR`)](https://huggingface.co/shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-5.4GB)** | **5.38** | **1.65** | **0.0895** | 0.2871 | **176 / 200 (88.0%)** | **116 / 164 (70.7%)** | **4 / 4** | **89.2% (84.8% pooled)** |
+| **[LookAtMyQuant 5.4 GB (`SQYFR v2`)](https://huggingface.co/shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-5.4GB)** | **5.38** | **1.65** | **0.0864** | **0.2773** | **174 / 200 (87.0%)** | **117 / 164 (71.3%)** | **4 / 4** | **89.0% (84.5% pooled)** |
+| **[LookAtMyQuant 4.7 GB (`SQYFR v3`, 12 GB iPhone)](https://huggingface.co/shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-4.7GB)** | **4.72** | **1.45** | **0.1162** | **0.3724** | **188 / 200 (94.0%)** | **113 / 164 (68.9%)** | **4 / 4** | **90.6% (87.4% pooled)** |
+| **[LookAtMyQuant 3.9 GB (`SQYFR v3`, 8 GB iPhone)](https://huggingface.co/shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-3.9GB)** | **3.85** | **1.18** | **0.2161** | **0.6037** | **179 / 200 (89.5%)** | **97 / 164 (59.1%)** | **4 / 4** | **85.5% (80.2% pooled)** |
 
-At **12.76 GB**, `Inkling-2-Mini-LookAtMyQuant-12.8GB` matches `100.0%` of the untouched BF16 teacher on every benchmark (`349 / 349` pooled) in `32.5%` less text weight memory. Both **11.18 GB** and **8.87 GB** retain `99.2–99.3%` 3-task mean (`345 / 349 = 98.9%` pooled), with **8.87 GB** cutting KL `2.34×` on English/chat/code (`0.0208` vs `0.0486`) and `29.6%` across all 13 languages (`0.0571` vs `0.0811`) below Unsloth's 9.14 GB `UD-Q2_K_XL` GGUF, while **5.38 GB** scores `88.0%` GSM8K and `70.7%` HumanEval (`105/164 = 64.0%` strict `<|content_text|>`; also beating 7.76 GB `UD-IQ1_S` and 9.14 GB `UD-Q2_K_XL` under an identical `384`-token harness). All four run through `lamq` and `runtime_mlx` via unified single-launch Metal kernels (`UnifiedMoESide` mixing unrotated `NVFP4` and Hadamard-rotated trellis experts across decode, speculative verify, and M5 `MetalPerformancePrimitives` prefill + FlashAttention-2 SDPA + exact unbiased `temp > 0` speculative sampling), optionally paired with the 178.9 MB [4-bit DSpark drafters](https://huggingface.co/shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-drafter): on Apple M5 Max, **12.8 GB** reaches **`2,016 tok/s`** `T=512` prefill, **`60.5 tok/s`** serial, and **`112.7 tok/s`** median lossless drafted decode (**`119.2 tok/s`** math, **`106.2 tok/s`** code; `12.72 GB` active RAM); **11.2 GB** reaches **`2,032 tok/s`** prefill, **`62.4 tok/s`** serial, and **`103.7 tok/s`** median (**`111.7 tok/s`** math; `11.13 GB` active RAM); **8.9 GB** decodes at **`63.5 tok/s`** serial and **`106.0 tok/s`** median (**`125.8 tok/s`** reasoning, **`123.8 tok/s`** math; `9.41 GB` active RAM); and **5.4 GB** reaches **`1,807 tok/s`** prefill, **`75.3 tok/s`** serial, and **`124.4 tok/s`** median (**`142.9 tok/s`** math, **`126.5 tok/s`** reasoning, **`122.2 tok/s`** code; `5.98 GB` active RAM).
+At **12.76 GB**, `Inkling-2-Mini-LookAtMyQuant-12.8GB` matches `100.0%` of the untouched BF16 teacher on every benchmark (`349 / 349` pooled) in `32.5%` less text weight memory. Both **11.18 GB** and **8.87 GB** retain `99.2–99.3%` 3-task mean (`345 / 349 = 98.9%` pooled), with **8.87 GB** cutting KL `2.34×` on English/chat/code (`0.0208` vs `0.0486`) and `29.6%` across all 13 languages (`0.0571` vs `0.0811`) below Unsloth's 9.14 GB `UD-Q2_K_XL` GGUF. Below `2 bpp`, `SQYFR v2` lifts **5.38 GB** (`1.65 bpp`) to `90.0%` top-1 agreement (`free_KL = 0.0864`), `87.0%` GSM8K, and `71.3%` strict HumanEval (`117 / 164`), while `SQYFR v3` (combining two-pass on-policy student-prefix `DAgger` distillation, surgical within-stage `128`-row-group Fisher outlier splitting, and `950` exact-`P` polish steps over `14.15M` row scales + `440K–452K` `float16` pre-RHT input-column scales + `38.8M` native steering) lifts **4.72 GB** (`1.45 bpp`, sized to fit under the 12 GB iPhone `5.99 GiB` Jetsam ceiling alongside the 179 MB drafter at `4.35 GiB` active / `5.35 GiB` decode peak) to **`94.0%` GSM8K (`188 / 200`, `97.4%` of the BF16 teacher)** and **`68.9%` strict HumanEval (`113 / 164`, `90.6%` 3-task mean)**, and lifts **3.85 GB** (`1.18 bpp`, `3.54 GiB` active / `4.57 GiB` decode peak for 8 GB devices) from static PTQ collapse (`1.0%` GSM8K, `1.8%` HumanEval) to **`89.5%` GSM8K (`179 / 200`)**, **`59.1%` strict HumanEval (`97 / 164`)**, and **`4 / 4` Vision (`85.5%` 3-task mean)**.
+
+All six run through `lamq` and `runtime_mlx` via unified single-launch Metal kernels (`UnifiedMoESide` mixing unrotated `NVFP4` and Hadamard-rotated per-expert or `128`-row-group trellis experts across decode, speculative verify, and M5 `MetalPerformancePrimitives` prefill + FlashAttention-2 SDPA + exact unbiased `temp > 0` speculative sampling), optionally paired with the 178.9 MB [4-bit DSpark drafters](https://huggingface.co/shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-drafter): on Apple M5 Max, **12.8 GB** reaches **`2,016 tok/s`** `T=512` prefill, **`60.5 tok/s`** serial, and **`112.7 tok/s`** median lossless drafted decode (**`119.2 tok/s`** math, **`106.2 tok/s`** code; `12.72 GB` active RAM); **11.2 GB** reaches **`2,032 tok/s`** prefill, **`62.4 tok/s`** serial, and **`103.7 tok/s`** median (**`111.7 tok/s`** math; `11.13 GB` active RAM); **8.9 GB** decodes at **`63.5 tok/s`** serial and **`106.0 tok/s`** median (**`125.8 tok/s`** reasoning, **`123.8 tok/s`** math; `9.41 GB` active RAM); **5.4 GB** reaches **`1,807 tok/s`** prefill, **`75.3 tok/s`** serial, and **`124.4 tok/s`** median (**`142.9 tok/s`** math, **`126.5 tok/s`** reasoning; `5.33 GB` active RAM); **4.7 GB** decodes at **`69.2 tok/s`** serial and up to **`129.0 tok/s`** on math (`3.25 tok/check`, `94.7 tok/s` code; `4.67 GB` active RAM); and **3.9 GB** decodes at **`75.8 tok/s`** serial and **`113.0 tok/s`** median (**`117.3 tok/s`** math, **`108.5 tok/s`** code; `3.81 GB` active RAM).
 
 ## Install and use the Apple Silicon runtime
 
@@ -66,6 +70,10 @@ lamq generate shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-12.8GB \
 lamq generate shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-5.4GB \
     --drafter shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-drafter \
     -p "What is 17 times 23? Show the steps." --stats
+
+lamq generate shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-4.7GB \
+    --drafter shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-drafter \
+    -p "Write a Python function that merges overlapping intervals." --stats
 ```
 
 `lamq generate` reads stdin when `-p` is omitted, supports `--raw`, `--system`, `--thinking`, `--temp`, `--mode linear|chat-fork|copy-wide`, `--no-adaptive`, and `--json`. `lamq info <model>` inspects a packed model's format and dimensions without loading weights.
@@ -98,38 +106,39 @@ for chunk in rt.stream("Solve 3x + 4y = 31 and 5x - 2y = 17.", max_tokens=256):
     print(chunk.text, end="", flush=True)
 ```
 
+**OpenAI-compatible server.** `lamq serve` puts a packed Inkling-2-Mini model behind `/v1/chat/completions`, streaming or not, so chat clients and coding agents can use it. Requests go through the model's own chat template, including `tools` and `reasoning_effort`; thinking comes back as `reasoning_content` and tool invocations as `tool_calls`.
+
+When a request lists tools, `"tool_choice": "auto"` lets the model choose whether to call one. This is the default. Set `"tool_choice": "none"` to disable calls for that turn. Requests that require a call or force a particular function receive HTTP 400.
+
+```sh
+lamq serve shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-5.4GB \
+    --drafter shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-drafter --port 8080
+
+curl http://localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
+    -d '{"messages": [{"role": "user", "content": "What is 17 times 23?"}], "reasoning_effort": "low"}'
+```
+
+`--context` (default 32768) caps prompt plus completion. A longer prompt gets llama.cpp's "exceeds the available context size" error, which agent clients take as a cue to compact. Requests have a 1 MiB JSON limit and receive HTTP 503 if the model is busy. The server binds to `127.0.0.1` by default and rejects requests with a browser `Origin` header. Set `LAMQ_API_KEY` to require `Authorization: Bearer <key>` on every endpoint. Other bind addresses require a key. Use a TLS-terminating proxy for connections over an untrusted network.
+
+For a trusted single-user MLX loopback server, `--prompt-cache N` keeps up to N prefilled KV snapshots (0 by default). An extension to an earlier prompt reuses its matching snapshot, and an identical retry prefills one token. The server disables reuse when requiring a bearer key or binding to a network address. In Python, pass `prompt_cache=PromptCache()` from `runtime_mlx.inkling` to `stream_dspark` or `stream_serial`.
+
+Use `POST /apply-template` to render a chat prompt or `POST /tokenize` with a `content` string to return token IDs.
+
+Inkling prefill uses one pass when the prompt fits the estimated MLX memory budget and chunks long prompts under memory pressure. Set `--prefill-chunk N` in `lamq generate`, `lamq chat`, or `lamq serve` to choose a chunk size, or set it to 0 for one pass.
+
+The optimized MLX runtime stores the attention cache in FP16 by default. Set `LAMQ_GLOBAL_KV=fp8` or `LAMQ_GLOBAL_KV=q4` to reduce global attention cache memory on long prompts. Both options can change generated tokens. Sliding-window attention keeps its FP16 cache.
+
 ## Run Inkling-2-Mini on NVIDIA GPUs
 
-`runtime_cuda` runs the packed Inkling-2-Mini files on NVIDIA GPUs with compute capability 8.0 or newer (Ampere onward). It reads the same files as `runtime_mlx`, trellis, Lloyd–Max and NVFP4 experts included, and decodes them inside Triton kernels. It has been run end to end on the 8.9 GB and 11.2 GB builds; the 5.4 GB and 12.8 GB builds use the same formats.
+Install the CUDA extra on a machine with a supported NVIDIA GPU. The public model ID and chat template are shared with the Apple Silicon runtime.
 
 ```sh
 pip install -e ".[cuda]"
-python -m runtime_cuda generate shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-8.9GB \
-    -p "What is 17 times 23? Show the steps." --stats
-python -m runtime_cuda info shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-11.2GB
+lamq generate shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-8.9GB --device cuda -p "What is 17 times 23?"
+lamq serve shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-8.9GB --device cuda
 ```
 
-```python
-from runtime_cuda import load, generate
-
-model, tok = load("shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-8.9GB")
-print(generate(model, tok, "What is 17 times 23? Show the steps.", max_tokens=200))
-```
-
-`generate` takes `lamq generate`'s `-p`, `--system`, `--thinking`, `--raw`, `--json` and `--stats`. With thinking off the model still opens a short thinking channel before it answers; `--no-thinking` (`no_thinking=True`) never lets it pick the token that opens that channel, so it usually answers directly (it can still write a few lines of reasoning as plain text).
-
-On one RTX A4500 (20 GB, Ampere), greedy and one token at a time, a decode step is captured in a CUDA graph:
-
-| Build | Decode | 512-token prefill | Peak memory |
-|---|---:|---:|---:|
-| 8.9 GB | 57.8 tok/s (17.2 ms a token) | 249 tok/s | 10.6 GB |
-| 11.2 GB | 56.1 tok/s (17.8 ms a token) | 127 tok/s | 12.9 GB |
-
-The prefill of the NVFP4 experts is not yet tuned. Decoding is greedy; the DSpark drafter and sampling are not ported yet.
-
-Four checks tie the runtime to the quantizer and the original model. The decoders match the float64 NumPy references in `runtime_mlx/inkling/kernels.py`. Every decoded matrix matches the original checkpoint's weight to within its quantization error (`python -m runtime_cuda.check_weights`; one convention broken on purpose gives about 140%). The whole model matches transformers' own `Inkling2Loop` with the packed matrices decoded to float32 (`python -m runtime_cuda.compare`), and `runtime_mlx`'s synthetic test model runs through it. Exact agreement is not possible: a perturbation of 1e-7 flips near-tied expert choices and the change spreads through the 48 layer visits, so two correct implementations differ by a KL of about 1e-4 to 1e-3 on ordinary text. Against the original model (`python -m runtime_cuda.kl_eval`), on WikiText-2 and Python source rather than the text mix above, the 8.9 GB build is at a KL of 0.040 (English) and 0.031 (code) and the 11.2 GB build at 0.019 and 0.017.
-
-Kernel settings are measured per GPU (`python -m runtime_cuda.tune`). Tables for the RTX A4500, RTX 4090, L4 and RTX 5080 are in `runtime_cuda/inkling/tuning/`; other cards take the nearest measured card of their architecture, and `runtime_cuda/inkling/tuning/COVERAGE.md` lists what 42 common cards get. `runtime_cuda/SYNC.md` maps each file to its counterpart in `runtime_mlx` and lists what is not ported.
+Triton handles ordinary generation and NVFP4 experts. The native CUDA engine supports DSpark on trellis packs. See the [CUDA runtime](runtime_cuda/README.md) for model support, revision selection, and benchmark commands.
 
 ## Run the compiler on SmolLM2-360M in three commands
 
@@ -282,11 +291,12 @@ python pack_drafter.py path/to/drafter path/to/drafter-4bit
 | `math_bench.py`, `math_eval.py`, `text_kl.py` | The exact-answer math benchmark, its runner for the Qwen3.5 family and Bonsai, and KL from the original on text |
 | `gguf_compiler.py`, `public_eval.py`, `eval_tasks.py` | The llama.cpp route, public quantizations and task benchmarks |
 | `pyproject.toml`, `runtime_mlx/runtime.py`, `runtime_mlx/cli.py` | Installable Apple Silicon runtime package, unified `load`/`Runtime` Python API, and `lamq` CLI |
+| `runtime_mlx/server.py`, `runtime_mlx/test_server.py` | `lamq serve`, the OpenAI-compatible server for packed Inkling-2-Mini models, and its tests |
 | `lamq_export.py`, `runtime_mlx/` | The export format and the Apple Silicon runtime |
 | `runtime_mlx/fast_q35.py`, `block_q35.py`, `block_argmax_q35.py`, `pack_dense.py`, `modal_pack.py` | The runtime for packed Qwen3.5-4B and Qwen3.8-27B files: one token at a time, a block of 8 or 16 tokens in one pass, and the packer |
 | `runtime_mlx/inkling/`, `runtime_mlx/test_inkling.py` | Apple Silicon MLX runtime, 4 KB SRAM `ht2`/`ht3` Metal kernels, and 4-bit DSpark block-8 speculative drafter for packed Inkling-2-Mini models |
-| `runtime_cuda/`, `runtime_cuda/inkling/` | The CUDA runtime for packed Inkling-2-Mini models: Triton kernels, the model, per-GPU tuning, a float32 transformers reference, and the checks against it and the original |
-| `runtime_cuda/tune.py`, `remote_tune.sh`, `tuning_coverage.py`, `upstream_sync.py` | Measuring a GPU's kernel settings, on this machine or a rented one, what each card gets, and what changed in `runtime_mlx` since the last sync |
+| `runtime_cuda/inkling/`, `runtime_cuda/inkling_cuda/` | Triton and native CUDA engines for packed Inkling-2-Mini models, with a float32 Transformers reference for comparison |
+| `runtime_cuda/tune.py`, `runtime_cuda/tuning_coverage.py`, `runtime_cuda/upstream_sync.py` | Measure and inspect per-GPU kernel settings and compare CUDA source coverage with the MLX runtime |
 | `runtime_mlx/drafter_q35.py`, `draft_vocab_q35.py`, `convert_dspine.py`, `check_drafter.py`, `bench_drafted.py`, `drafter/`, `modal_drafter.py`, `pack_drafter.py` | Speculative decoding with a DSpine drafter, Tencent DSpine conversion, drafter training, and the drafter stored at 4 bits |
 | `opgraph/` | The grammar: a model as a tensor network, and the rewrites and codes that act on it |
 | `run_completeness.py`, `make_report.py` | The check that nine published methods are reproduced exactly |
@@ -297,8 +307,7 @@ python pack_drafter.py path/to/drafter path/to/drafter-4bit
 | `cache/codes/` | The e-means trellis codebooks at 1 to 4 bits |
 | `results/batch/`, `results/gguf/` | The measurements and plan runs behind the site |
 | `results/COMPILER.md`, `results/COMPLETENESS.md` | Write-ups of the compiler on SmolLM2-360M and Qwen3.5-4B, and of the reproduction check |
-| `site/` | The website. Run `python3 -m http.server 8000` inside it, then visit http://localhost:8000 |
-| `site2/` | The LookAtMyQuant 2 page. It runs the same way |
+| `site/` | The website: the front page, and each paper in its own folder (`compiler/`, `2/`, `grafting/`). Run `python3 -m http.server 8000` inside it, then visit http://localhost:8000 |
 | `tests/` | Tests of the grammar and the codes |
 
 ## The tests need SmolLM2-360M and WikiText-2
@@ -319,7 +328,9 @@ python tests/test_reallocation.py
 
 `runtime_mlx/test_fast_q35.py` and `runtime_mlx/test_block_q35.py` check the Qwen3.5 kernels against NumPy products of independently unpacked codes, with no model. When `LAMQ_Q35_PACKED` names a packed file, the second also checks a block of tokens against decoding them one at a time. When `LAMQ_Q38_PACKED` names the packed Qwen3.8-27B file, it runs the same checks on a model whose output head is stored apart from its embedding.
 
-`pytest runtime_cuda/` runs the CUDA runtime's tests. The kernel and format tests need only a GPU. The model tests also need the packed files in `models/` and the reference outputs that `python -m runtime_cuda.compare <packed dir> --save cache/oracle` writes, and skip without them; the comparison with transformers needs transformers from git main.
+`runtime_mlx/test_inkling.py` checks the Inkling-2-Mini runtime on a miniature packed model it builds, including chunked prefill and `PromptCache` reuse against a fresh prefill. `runtime_mlx/test_server.py` checks `lamq serve`'s output parsing, message conversion and HTTP layer, with no model.
+
+`python -m pytest runtime_cuda/` exercises the CUDA runtimes. GPU kernel checks use synthetic inputs. Checkpoint comparisons also require the packed weights and their reference outputs.
 
 ## What this repository leaves out
 
