@@ -107,3 +107,35 @@ def test_moe_side_cuda_nvfp4(trellis, m, n, x_div):
     want = torch.stack([(x_raw if int(slab_of[e]) == NV_SLAB else x_rot)[i // x_div].double() @ W[int(e)].T
                         for i, e in enumerate(eids.tolist())])
     assert ((out.double() - want).norm() / want.norm()).item() < 1e-5
+
+
+@pytest.mark.parametrize("groups", [2, 18])
+@pytest.mark.parametrize("n,x_div", [(2304, 8), (1152, 1)])
+def test_moe_side_cuda_row_groups(groups, n, x_div):
+    """SQYFR v3 row groups: each expert's 2304 rows in `groups` groups, each group its own format and slab index
+    (`slab_of` / `loc_of` indexed expert * groups + group)."""
+    from runtime_cuda.inkling.moe_cuda import MoESideCUDA
+
+    rng = np.random.default_rng(groups + n)
+    E, m = 12, 2304
+    rows = m // groups
+    fmts = ["ht2", "ht3", "rtr4"]
+    owner = rng.integers(0, len(fmts), size=E * groups)  # format of each (expert, group)
+    owner[: len(fmts)] = np.arange(len(fmts))
+    slabs, parts = [], {}
+    slab_of, loc_of = np.zeros(E * groups, np.int32), np.zeros(E * groups, np.int32)
+    for j, fmt in enumerate(fmts):
+        ids = np.nonzero(owner == j)[0]
+        codes, scales, lut = _rand_trellis(rng, len(ids), rows, n, fmt)
+        slabs.append((fmt, codes, scales, lut))
+        Wf = decode_trellis(codes, scales, lut, n, fmt)
+        for loc, eg in enumerate(ids):
+            slab_of[eg], loc_of[eg], parts[int(eg)] = j, loc, Wf[loc].double()
+    W = {e: torch.cat([parts[e * groups + g] for g in range(groups)]) for e in range(E)}
+    side = MoESideCUDA(slabs, torch.from_numpy(slab_of).to(DEV), torch.from_numpy(loc_of).to(DEV), m, n, groups=groups)
+    eids = torch.from_numpy(rng.integers(0, E, size=16)).to(DEV)
+    x = torch.randn(16 // x_div, n, device=DEV)
+    out = torch.full((16, m), float("nan"), device=DEV)
+    side(x, eids, x_div, out=out)
+    want = torch.stack([x[i // x_div].double() @ W[int(e)].T for i, e in enumerate(eids.tolist())])
+    assert ((out.double() - want).norm() / want.norm()).item() < 1e-5

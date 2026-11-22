@@ -155,9 +155,12 @@ class MoESideCUDA:
     `nvfp4` = (codes [E, m, n/2] uint8, block scales [E, m, n/16] uint8, outer [E] float32)."""
 
     def __init__(self, slabs, slab_of: torch.Tensor, loc_of: torch.Tensor, m: int, n: int, rps: int = 4, lpr: int = 16,
+                 groups: int = 1,
                  nvfp4=None):
         assert len(slabs) <= 4 and (slabs or nvfp4 is not None)
         self.m, self.n, self.rps, self.lpr, self._slabs = m, n, rps, lpr, slabs
+        assert m % groups == 0, (m, groups)
+        self.groups = groups
         self.slab_of, self.loc_of = slab_of, loc_of
         self.args, cases, tab_bytes = [], [], 0
         for j, (fmt, codes, scales, lut) in enumerate(slabs):
@@ -186,12 +189,17 @@ class MoESideCUDA:
 extern "C" __global__ void __launch_bounds__({THREADS}) moe_side(const float* __restrict__ x, int x_div, int stride_x,
         const float* __restrict__ x_raw, int stride_xr,
         const void* __restrict__ eids, int eid64, const int* __restrict__ slab_of, const int* __restrict__ loc_of,
-        float* __restrict__ y, int stride_y, int m, int n, {params}) {{
+        float* __restrict__ y, int stride_y, int m, int n, int groups, {params}) {{
+    // `m` rows a row group; with `groups` > 1 (SQYFR v3) each expert's rows come in `groups` groups of `m`, each with
+    // its own format slab and slab index at slab_of / loc_of[expert * groups + group].
     extern __shared__ __align__(16) unsigned char smem[];
     const int slot = blockIdx.y;
-    const int eid = eid64 ? (int)((const long long*)eids)[slot] : ((const int*)eids)[slot];  // the router's are int64
-    const int r0 = blockIdx.x * ({THREADS} / LANES_PER_ROW) * ROWS_PER_HW + (threadIdx.x / LANES_PER_ROW) * ROWS_PER_HW;
-    float* yrow = y + (long long)slot * stride_y;
+    const int rpb = ({THREADS} / LANES_PER_ROW) * ROWS_PER_HW;
+    const int bpg = (m + rpb - 1) / rpb;
+    const int group = blockIdx.x / bpg;
+    const int r0 = (blockIdx.x % bpg) * rpb + (threadIdx.x / LANES_PER_ROW) * ROWS_PER_HW;
+    const int eid = (eid64 ? (int)((const long long*)eids)[slot] : ((const int*)eids)[slot]) * groups + group;  // the router's are int64
+    float* yrow = y + (long long)slot * stride_y + (long long)group * m;
     const float* xs = x + (long long)(slot / x_div) * stride_x;
     const float* xr = x_raw + (long long)(slot / x_div) * stride_xr;  // NVFP4 experts: the unrotated activation
     const long long e = loc_of[eid];
@@ -215,7 +223,8 @@ extern "C" __global__ void __launch_bounds__({THREADS}) moe_side(const float* __
             assert t.dtype == torch.float32 and t.stride(-1) == 1, (t.dtype, t.stride())
         assert eids.dtype in (torch.int32, torch.int64), eids.dtype
         y = out if out is not None else torch.empty(S, self.m, dtype=torch.float32, device=x.device)
-        grid = ((self.m + self.rows_per_block - 1) // self.rows_per_block, S)
+        rows = self.m // self.groups
+        grid = (self.groups * ((rows + self.rows_per_block - 1) // self.rows_per_block), S)
         self.kernel(grid, (THREADS,), [x, x_div, x.stride(0), xr, xr.stride(0), eids, int(eids.dtype == torch.int64), self.slab_of, self.loc_of, y, y.stride(0),
-                                       self.m, self.n, *self.args], self.smem)
+                                       rows, self.n, self.groups, *self.args], self.smem)
         return y

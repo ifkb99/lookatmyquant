@@ -345,7 +345,7 @@ class MoESideGEMV:
         from . import moe_cuda
 
         if moe_cuda.enabled():
-            self.cuda_c = moe_cuda.MoESideCUDA(slabs, self.slab_of, self.loc_of, m, n, nvfp4=nvfp4)
+            self.cuda_c = moe_cuda.MoESideCUDA(slabs, self.slab_of, self.loc_of, m, n, nvfp4=nvfp4, groups=groups)
 
     def __call__(self, x: torch.Tensor, eids: torch.Tensor, x_div: int, out: torch.Tensor | None = None,
                  x_raw: torch.Tensor | None = None) -> torch.Tensor:
