@@ -164,17 +164,19 @@ def _router_topk_kernel(S, B, IDX, WT, E, scale, K: tl.constexpr, BE: tl.constex
     ok = e < E
     s = tl.load(S + t * E + e, mask=ok, other=0.0)
     v = tl.where(ok, s + tl.load(B + e, mask=ok, other=0.0), float("-inf"))
-    tot = 0.0
+    # the K picks stay in registers: storing them and reading them back for the normalization would race (Triton
+    # puts no barrier between a program's global stores and loads), and read whatever the allocator left there
+    k = tl.arange(0, K)
+    picks = tl.zeros((K,), tl.int64)
+    wsel = tl.zeros((K,), tl.float32)
     for j in tl.static_range(K):
         i = tl.argmax(v, axis=0)
         sel = e == i
-        tot += tl.sum(tl.where(sel, s, 0.0), axis=0)
-        tl.store(IDX + t * K + j, i.to(tl.int64))
-        tl.store(WT + t * K + j, tl.sum(tl.where(sel, s, 0.0), axis=0))
+        picks = tl.where(k == j, i.to(tl.int64), picks)
+        wsel = tl.where(k == j, tl.sum(tl.where(sel, s, 0.0), axis=0), wsel)
         v = tl.where(sel, float("-inf"), v)
-    k = tl.arange(0, K)
-    w = tl.load(WT + t * K + k)
-    tl.store(WT + t * K + k, w / (tot + 1e-20) * scale)
+    tl.store(IDX + t * K + k, picks)
+    tl.store(WT + t * K + k, wsel / (tl.sum(wsel, axis=0) + 1e-20) * scale)
 
 
 def route_top8_fused(h: torch.Tensor, router_w: torch.Tensor, router_bias: torch.Tensor, k: int, route_scale: float):
