@@ -34,6 +34,7 @@ def _bar_kernel(
     NQ: tl.constexpr, NS: tl.constexpr, NORM_OUT: tl.constexpr, BH: tl.constexpr,
 ):
     t = tl.program_id(0).to(tl.int64)
+    qi = tl.program_id(1)  # one program a query: each normalizes the (few, small) states itself
     h = tl.arange(0, BH)
     ok = h < H
     eps_norm = eps_norm.to(tl.float32)
@@ -47,7 +48,7 @@ def _bar_kernel(
     x4 = _ld_norm(S4, t, H, h, ok, eps_norm) if NS > 4 else x0
     x5 = _ld_norm(S5, t, H, h, ok, eps_norm) if NS > 5 else x0
     x6 = _ld_norm(S6, t, H, h, ok, eps_norm) if NS > 6 else x0
-    for qi in tl.static_range(NQ):
+    if True:
         q = tl.load(Q + qi * H + h, mask=ok, other=0.0)
         c0 = _score(q, x0, inv_sqrt_h, True)
         c1 = _score(q, x1, inv_sqrt_h, NS > 1)
@@ -76,7 +77,7 @@ def block_attn_res_fused(query: torch.Tensor, states: list[torch.Tensor], ln_w: 
     ptrs = [s if s.is_contiguous() else s.contiguous() for s in states] + [states[0]] * (7 - NS)
     out = torch.empty(NQ, T, H, dtype=torch.float32, device=query.device)
     with torch.cuda.device(query.device):
-        _bar_kernel[(T,)](query, *ptrs, ln_w if ln_w is not None else query, out, T, H, 1e-6, eps,
+        _bar_kernel[(T, NQ)](query, *ptrs, ln_w if ln_w is not None else query, out, T, H, 1e-6, eps,
                           NQ=NQ, NS=NS, NORM_OUT=ln_w is not None, BH=triton.next_power_of_2(H), num_warps=8)
     return out
 
@@ -131,8 +132,62 @@ def message_gates_fused(h: torch.Tensor, msg: torch.Tensor, dw: torch.Tensor, fw
     h, msg = h.float().contiguous(), msg.float().contiguous()
     g = torch.empty(Gn, T, R, dtype=torch.float32, device=h.device)
     out = torch.empty_like(h)
-    RB, BHC = 8, 64
+    RB, BHC = 2, 16  # 4x more programs than (8, 64): 8.4 -> 6.3 / 9.2 -> 8.2 us (3 gates), 7.4 -> 4.3 / 6.5 -> 4.0 us (1) on an A4500
     with torch.cuda.device(h.device):
         _gate_down_kernel[(Gn, T, R // RB)](h, msg, dw, g, T, H, R=R, RB=RB, BH=triton.next_power_of_2(H), num_warps=4)
         _gate_out_kernel[(Gn, T, triton.cdiv(H, BHC))](h, msg, g, fw, mw, out, T, H, R=R, BHC=BHC, num_warps=4)
     return out
+
+
+@triton.jit
+def _router_scores_kernel(X, W, S, H, E, BE: tl.constexpr, BH: tl.constexpr):
+    """S[t, e] = sigmoid(x[t] . W[e]) for BE experts a program."""
+    t = tl.program_id(0).to(tl.int64)
+    e = tl.program_id(1) * BE + tl.arange(0, BE)
+    acc = tl.zeros((BE, BH), tl.float32)
+    for h0 in range(0, H, BH):
+        h = h0 + tl.arange(0, BH)
+        ok = h < H
+        x = tl.load(X + t * H + h, mask=ok, other=0.0).to(tl.float32)
+        w = tl.load(W + e[:, None].to(tl.int64) * H + h[None, :], mask=(e[:, None] < E) & ok[None, :], other=0.0)
+        acc += w * x[None, :]
+    z = tl.sum(acc, axis=1)
+    tl.store(S + t * E + e, 1.0 / (1.0 + tl.exp(-z)), mask=e < E)
+
+
+@triton.jit
+def _router_topk_kernel(S, B, IDX, WT, E, scale, K: tl.constexpr, BE: tl.constexpr):
+    """The K experts with the largest score + bias (ties: lowest index), and their scores renormalized * scale.
+    K rounds of argmax: 3.0 us on an A4500, against 3.7 us for one pass ranking all pairs."""
+    t = tl.program_id(0).to(tl.int64)
+    e = tl.arange(0, BE)
+    ok = e < E
+    s = tl.load(S + t * E + e, mask=ok, other=0.0)
+    v = tl.where(ok, s + tl.load(B + e, mask=ok, other=0.0), float("-inf"))
+    # the K picks stay in registers: storing them and reading them back for the normalization would race (Triton
+    # puts no barrier between a program's global stores and loads), and read whatever the allocator left there
+    k = tl.arange(0, K)
+    picks = tl.zeros((K,), tl.int64)
+    wsel = tl.zeros((K,), tl.float32)
+    for j in tl.static_range(K):
+        i = tl.argmax(v, axis=0)
+        sel = e == i
+        picks = tl.where(k == j, i.to(tl.int64), picks)
+        wsel = tl.where(k == j, tl.sum(tl.where(sel, s, 0.0), axis=0), wsel)
+        v = tl.where(sel, float("-inf"), v)
+    tl.store(IDX + t * K + k, picks)
+    tl.store(WT + t * K + k, wsel / (tl.sum(wsel, axis=0) + 1e-20) * scale)
+
+
+def route_top8_fused(h: torch.Tensor, router_w: torch.Tensor, router_bias: torch.Tensor, k: int, route_scale: float):
+    """`model.route_top8` in two launches for a few tokens: (idx int64 [T, k], weights float32 [T, k])."""
+    T, H = h.shape
+    E = router_w.shape[0]
+    x = h if h.dtype == torch.float32 and h.is_contiguous() else h.float().contiguous()
+    s = torch.empty(T, E, dtype=torch.float32, device=h.device)
+    idx = torch.empty(T, k, dtype=torch.int64, device=h.device)
+    w = torch.empty(T, k, dtype=torch.float32, device=h.device)
+    with torch.cuda.device(h.device):  # one expert a program: 5.5 -> 3.8 us on an A4500 (router weights from DRAM)
+        _router_scores_kernel[(T, E)](x, router_w, s, H, E, BE=1, BH=256, num_warps=2)
+        _router_topk_kernel[(T,)](s, router_bias, idx, w, E, route_scale, K=k, BE=triton.next_power_of_2(E), num_warps=2)
+    return idx, w

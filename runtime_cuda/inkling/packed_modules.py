@@ -44,6 +44,16 @@ class _Mat:
 
     def gemv(self, x, expert_ids=None, x_div=1, out=None, zero_skipped=True):
         table = self.levels if self.fmt.startswith("lm") else self.lut
+        if expert_ids is None and x.shape[0] == 1 and x.dtype == torch.float32 and x.stride(-1) == 1:
+            from .nvrtc import enabled
+
+            if enabled():  # the experimental CUDA C kernel, a one-matrix stage (dense_cuda.py)
+                if getattr(self, "_cuda_c", None) is None:
+                    from .dense_cuda import DenseStageCUDA
+
+                    self._cuda_c = DenseStageCUDA([(self.fmt, self.m, self.codes, self.scales, table)], self.n, [0])
+                y = self._cuda_c(x, out=None if out is None else out.view(-1))
+                return y.view(1, self.m) if out is None else out
         return packed_gemv(x, self.codes, self.scales, self.fmt, self.m, self.n, table, expert_ids=expert_ids,
                            x_div=x_div, out=out, zero_skipped=zero_skipped)
 

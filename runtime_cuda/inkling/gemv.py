@@ -341,6 +341,11 @@ class MoESideGEMV:
         self.nslab = len(slabs)
         if not self.has_nv:
             self.nv = [self.ptrs[0], self.ptrs[1], self.ptrs[1], self.ptrs[1], self.ptrs[1]]
+        self.cuda_c = None  # the experimental CUDA C decode kernel (moe_cuda.py)
+        from . import moe_cuda
+
+        if moe_cuda.enabled():
+            self.cuda_c = moe_cuda.MoESideCUDA(slabs, self.slab_of, self.loc_of, m, n, nvfp4=nvfp4, groups=groups)
 
     def __call__(self, x: torch.Tensor, eids: torch.Tensor, x_div: int, out: torch.Tensor | None = None,
                  x_raw: torch.Tensor | None = None) -> torch.Tensor:
@@ -350,6 +355,8 @@ class MoESideGEMV:
         if self.has_nv:
             assert x_raw is not None, "this side has NVFP4 experts: pass x_raw (the unrotated activation)"
         xr = x_raw if x_raw is not None else x
+        if self.cuda_c is not None:
+            return self.cuda_c(x, eids, x_div, out=y, x_raw=x_raw)
         with torch.cuda.device(x.device):
             _moe_gemv_kernel[(self.groups * triton.cdiv(self.group_rows, self.BLOCK_M), S)](
                 x, eids, self.slab_of, self.loc_of, y, *self.ptrs, xr, *self.nv, xr.stride(0),
@@ -480,9 +487,18 @@ class DenseStageGEMV:
                                 f"CH{i}": CH, f"NW{i}": nw, f"SW{i}": sw})
         self.blocks = rb
         self.nseg = len(mats)
+        from .nvrtc import enabled
+
+        self.cuda_c = None  # the experimental CUDA C stage kernel (dense_cuda.py)
+        if enabled():
+            from .dense_cuda import DenseStageCUDA
+
+            self.cuda_c = DenseStageCUDA(mats, n, x_rows)
 
     def __call__(self, x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
         """x `[R, n]` float32 (stacked inputs); returns the concatenated outputs `[total]`."""
+        if self.cuda_c is not None:
+            return self.cuda_c(x, out=out)
         y = out if out is not None else torch.empty(self.total, dtype=torch.float32, device=x.device)
         with torch.cuda.device(x.device):
             _dense_stage_kernel[(self.blocks,)](x, y, self.n, x.stride(0), *self.args,
