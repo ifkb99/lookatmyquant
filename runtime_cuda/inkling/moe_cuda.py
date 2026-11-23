@@ -42,10 +42,41 @@ __device__ __forceinline__ float h1f(u16 v) { float a; asm("cvt.f32.f16 %0, %1;"
 __device__ __forceinline__ float tab1(float v) { return v; }
 __device__ __forceinline__ float tab1(u16 v) { return h1f(v); }
 
-// One slab's rows [r0, r0 + RPS) of expert e times the activation in shared memory (transposed: column j of chunk c
-// at s_x[j * nch + c], so the lanes of a half-warp read consecutive words). Trellis rows store their column groups
-// from the high end (12-bit states, hashed or not); Lloyd-Max rows (LM) are a plain bitstream of K-bit indices into
-// a float32 level table.
+// The block's table and activation into shared memory, every global load issued before any store (a load-then-store
+// loop waits out one L2 round trip an element). The activation is stored transposed (column j of chunk c at
+// s_x[j * nch + c]) so the lanes of a half-warp read consecutive words. (Interleaved copies of the table, one a lane
+// group, to spread the random lookups over more banks measured slower: 2 copies 5%, 8 copies 50%.)
+template <int CH, typename TAB>
+__device__ __forceinline__ void stage_inputs(const TAB* __restrict__ tab, int tab16, const float* __restrict__ xs, int n,
+        TAB* s_tab, float* s_x) {
+    constexpr int TV = (TAB_BYTES / 16 + NTHREADS - 1) / NTHREADS;
+    constexpr int XV = (MAX_N / 4 + NTHREADS - 1) / NTHREADS;
+    const int nx4 = n / 4, nch = n / CH;
+    uint4 tv[TV];
+    float4 xv[XV];
+    #pragma unroll
+    for (int j = 0; j < TV; j++) { const int i = threadIdx.x + j * NTHREADS; if (i < tab16) tv[j] = __ldg(reinterpret_cast<const uint4*>(tab) + i); }
+    #pragma unroll
+    for (int j = 0; j < XV; j++) { const int i = threadIdx.x + j * NTHREADS; if (i < nx4) xv[j] = __ldg(reinterpret_cast<const float4*>(xs) + i); }
+    #pragma unroll
+    for (int j = 0; j < TV; j++) {
+        const int i = threadIdx.x + j * NTHREADS;
+        if (i < tab16) reinterpret_cast<uint4*>(s_tab)[i] = tv[j];
+    }
+    #pragma unroll
+    for (int j = 0; j < XV; j++) {
+        const int i = threadIdx.x + j * NTHREADS;
+        if (i < nx4) {
+            const float v[4] = {xv[j].x, xv[j].y, xv[j].z, xv[j].w};
+            #pragma unroll
+            for (int q = 0; q < 4; q++) s_x[((4 * i + q) % CH) * nch + (4 * i + q) / CH] = v[q];
+        }
+    }
+}
+
+// One slab's rows [r0, r0 + RPS) of expert e times the activation in shared memory. Trellis rows store their column
+// groups from the high end (12-bit states, hashed or not); Lloyd-Max rows (LM) are a plain bitstream of K-bit indices
+// into a float32 level table.
 template <bool LM, int K, int G, int LOGK, u32 HASH, int CH, int NW, int RPS, int LPR, typename TAB>
 __device__ __forceinline__ void slab_rows(const float* __restrict__ xs, const u32* __restrict__ codes,
         const u16* __restrict__ scales, const TAB* __restrict__ tab, int ntab, float* __restrict__ yrow,
@@ -53,8 +84,7 @@ __device__ __forceinline__ void slab_rows(const float* __restrict__ xs, const u3
     TAB* s_tab = reinterpret_cast<TAB*>(smem);
     float* s_x = reinterpret_cast<float*>(smem + TAB_BYTES);
     const int nch = n / CH, wpr = n * K / 32;
-    for (int i = threadIdx.x; i < ntab; i += blockDim.x) s_tab[i] = tab[i];
-    for (int i = threadIdx.x; i < n; i += blockDim.x) s_x[(i % CH) * nch + i / CH] = xs[i];
+    stage_inputs<CH, TAB>(tab, ntab * (int)sizeof(TAB) / 16, xs, n, s_tab, s_x);
     __syncthreads();
     const int hl = threadIdx.x % LPR;
     float acc[RPS];
@@ -73,7 +103,9 @@ __device__ __forceinline__ void slab_rows(const float* __restrict__ xs, const u3
             #pragma unroll
             for (int i = 0; i < NW; i++) w[i] = (wb + i < wpr) ? __ldg(p + i) : 0u;
             w[NW] = 0u;
-            float a = 0.f;
+            // one fused multiply-add a weight, straight into the row's accumulator (`a += p * x + q * y` compiles to
+            // separate multiplies and adds)
+            float a = acc[r];
             #pragma unroll
             for (int gi = 0; gi < CH / G; gi++) {
                 const int bit = LM ? gi * K : (CH - (gi + 1) * G) * K;
@@ -82,15 +114,19 @@ __device__ __forceinline__ void slab_rows(const float* __restrict__ xs, const u3
                 const u32 idx = HASH ? (st * HASH) >> (32 - LOGK) : st;
                 const TAB v = s_tab[idx];
                 if constexpr (G == 1) {
-                    a += tab1(v) * xr[gi];
+                    a = fmaf(tab1(v), xr[gi], a);
                 } else if constexpr (G == 2) {
-                    a += h2f_lo((u32)v) * xr[2 * gi] + h2f_hi((u32)v) * xr[2 * gi + 1];
+                    a = fmaf(h2f_lo((u32)v), xr[2 * gi], a);
+                    a = fmaf(h2f_hi((u32)v), xr[2 * gi + 1], a);
                 } else {
                     const u32 lo = (u32)v, hi = (u32)((u64)v >> 32);
-                    a += h2f_lo(lo) * xr[4 * gi] + h2f_hi(lo) * xr[4 * gi + 1] + h2f_lo(hi) * xr[4 * gi + 2] + h2f_hi(hi) * xr[4 * gi + 3];
+                    a = fmaf(h2f_lo(lo), xr[4 * gi], a);
+                    a = fmaf(h2f_hi(lo), xr[4 * gi + 1], a);
+                    a = fmaf(h2f_lo(hi), xr[4 * gi + 2], a);
+                    a = fmaf(h2f_hi(hi), xr[4 * gi + 3], a);
                 }
             }
-            acc[r] += a;
+            acc[r] = a;
         }
     }
     #pragma unroll
@@ -115,7 +151,7 @@ __device__ __forceinline__ void nvfp4_rows(const float* __restrict__ xs, const u
     float* s_x = reinterpret_cast<float*>(smem + TAB_BYTES);
     const int nch = n / 16, wpr = n / 8;
     for (int i = threadIdx.x; i < 16 + 256; i += blockDim.x) s_e2m1[i] = i < 16 ? e2m1[i] : e4m3[i - 16];
-    for (int i = threadIdx.x; i < n; i += blockDim.x) s_x[(i % 16) * nch + i / 16] = xs[i];
+    stage_inputs<16, float>(nullptr, 0, xs, n, nullptr, s_x);
     __syncthreads();
     const int hl = threadIdx.x % LPR;
     float acc[RPS];
@@ -147,6 +183,7 @@ __device__ __forceinline__ void nvfp4_rows(const float* __restrict__ xs, const u
 """
 
 _TAB_TYPE = {1: "u16", 2: "u32", 4: "u64"}
+
 NV_SLAB = 4  # as gemv.MoESideGEMV.NV_SLAB
 
 
@@ -155,10 +192,11 @@ class MoESideCUDA:
     `nvfp4` = (codes [E, m, n/2] uint8, block scales [E, m, n/16] uint8, outer [E] float32)."""
 
     def __init__(self, slabs, slab_of: torch.Tensor, loc_of: torch.Tensor, m: int, n: int, rps: int = 4, lpr: int = 16,
-                 groups: int = 1,
-                 nvfp4=None):
+                 groups: int = 1, nvfp4=None, minb: int = 3):
+        # minb: blocks an SM for __launch_bounds__ (3 caps registers at 80: 2 -> 3 blocks an SM, ~8% faster on an A4500)
         assert len(slabs) <= 4 and (slabs or nvfp4 is not None)
         self.m, self.n, self.rps, self.lpr, self._slabs, self._nvfp4 = m, n, rps, lpr, slabs, nvfp4
+        assert n % 4 == 0 and n <= 3072, n
         assert m % groups == 0, (m, groups)
         self.groups = groups
         self.slab_of, self.loc_of = slab_of, loc_of
@@ -167,10 +205,12 @@ class MoESideCUDA:
             k, g, logk, hm, CH, nw, table = _spec(fmt, lut)
             assert n % CH == 0 and (n * k) % 32 == 0, (fmt, n)
             tt = _TAB_TYPE[g]
-            tab_bytes = max(tab_bytes, table.numel() * table.element_size())
+            nbytes = table.numel() * table.element_size()
+            assert nbytes % 16 == 0 and table.data_ptr() % 16 == 0, (fmt, nbytes)  # staged with 16-byte loads
+            tab_bytes = max(tab_bytes, nbytes)
             self.args += [codes, scales, table, table.numel()]
-            cases.append(f"case {j}: slab_rows<false, {k}, {g}, {logk}, {hm}u, {CH}, {nw}, ROWS_PER_HW, LANES_PER_ROW, {tt}>(xs, (const u32*)C{j}, "
-                         f"(const u16*)S{j}, (const {tt}*)T{j}, N{j}, yrow, e, r0, m, n, smem); break;")
+            cases.append(f"case {j}: slab_rows<false, {k}, {g}, {logk}, {hm}u, {CH}, {nw}, ROWS_PER_HW, LANES_PER_ROW, {tt}>(xs, "
+                         f"(const u32*)C{j}, (const u16*)S{j}, (const {tt}*)T{j}, N{j}, yrow, e, r0, m, n, smem); break;")
         params = ", ".join(f"const void* C{j}, const void* S{j}, const void* T{j}, int N{j}" for j in range(len(slabs)))
         self.has_nv = nvfp4 is not None
         if self.has_nv:
@@ -184,9 +224,11 @@ class MoESideCUDA:
             cases.append(f"case {NV_SLAB}: nvfp4_rows<ROWS_PER_HW, LANES_PER_ROW>(xr, (const u32*)CN, (const unsigned char*)SN, "
                          "(const float*)ON, (const float*)E2, (const float*)E4, yrow, e, r0, m, n, smem); break;")
         self.smem = tab_bytes + n * 4
-        src = (f"#define TAB_BYTES {tab_bytes}\n#define ROWS_PER_HW {rps}\n#define LANES_PER_ROW {lpr}\n" + _PRELUDE
+        bounds = f"{THREADS}, {minb}" if minb else f"{THREADS}"
+        src = (f"#define TAB_BYTES {tab_bytes}\n#define ROWS_PER_HW {rps}\n#define LANES_PER_ROW {lpr}\n"
+               f"#define NTHREADS {THREADS}\n#define MAX_N 3072\n" + _PRELUDE
                + (_NVFP4 if self.has_nv else "") + f"""
-extern "C" __global__ void __launch_bounds__({THREADS}) moe_side(const float* __restrict__ x, int x_div, int stride_x,
+extern "C" __global__ void __launch_bounds__({bounds}) moe_side(const float* __restrict__ x, int x_div, int stride_x,
         const float* __restrict__ x_raw, int stride_xr,
         const void* __restrict__ eids, int eid64, const int* __restrict__ slab_of, const int* __restrict__ loc_of,
         float* __restrict__ y, int stride_y, int m, int n, int groups, {params}) {{
@@ -219,8 +261,9 @@ extern "C" __global__ void __launch_bounds__({THREADS}) moe_side(const float* __
         if self.has_nv:
             assert x_raw is not None, "this side has NVFP4 experts: pass x_raw (the unrotated activation)"
         xr = x_raw if x_raw is not None else x
-        for t in (x, xr):
-            assert t.dtype == torch.float32 and t.stride(-1) == 1, (t.dtype, t.stride())
+        for t in (x, xr):  # rows are staged with 16-byte loads
+            assert t.dtype == torch.float32 and t.stride(-1) == 1 and t.data_ptr() % 16 == 0 and t.stride(0) % 4 == 0, (
+                t.dtype, t.stride())
         assert eids.dtype in (torch.int32, torch.int64), eids.dtype
         y = out if out is not None else torch.empty(S, self.m, dtype=torch.float32, device=x.device)
         rows = self.m // self.groups

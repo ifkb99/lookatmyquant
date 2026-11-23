@@ -32,22 +32,27 @@ class DenseStageCUDA:
     """`mats`: list of (fmt, m, codes, scales, table); `x_rows[i]`: the row of the stacked input matrix i reads.
     Returns the outputs concatenated, `[sum m]`, like `DenseStageGEMV`."""
 
-    def __init__(self, mats, n: int, x_rows, rps: int | None = None, lpr: int | None = None):
+    def __init__(self, mats, n: int, x_rows, rps: int | None = None, lpr: int | None = None, minb: int | None = None):
         assert 1 <= len(mats) <= 8
         self.ms = [m for _, m, _, _, _ in mats]
         r, l = _shape(sum(self.ms), torch.cuda.get_device_properties(mats[0][2].device).multi_processor_count)
         self.n, self.rps, self.lpr = n, rps or r, lpr or l
         rps, lpr = self.rps, self.lpr
+        if minb is None:  # the LM head: 3 blocks an SM (<= 80 registers) measured 3% faster; the small stages gain nothing
+            minb = 3 if sum(self.ms) >= 32768 else 0
         self.offsets = [sum(self.ms[:i]) for i in range(len(mats))]
         self.total = sum(self.ms)
         rpb = (THREADS // lpr) * rps
+        assert n % 4 == 0 and n <= 3072, n
         self.args, cases, tab_bytes, rb = [], [], 0, 0
         for i, (fmt, m, codes, scales, table) in enumerate(mats):
             lm = fmt.startswith("lm")
             k, g, logk, hm, CH, nw, tab = _lm_spec(fmt, table) if lm else _spec(fmt, table)
             assert n % CH == 0 and (n * k) % 32 == 0, (fmt, n)
             tt = "float" if lm else _TAB_TYPE[g]
-            tab_bytes = max(tab_bytes, tab.numel() * tab.element_size())
+            nbytes = tab.numel() * tab.element_size()
+            assert nbytes % 16 == 0 and tab.data_ptr() % 16 == 0, (fmt, nbytes)  # staged with 16-byte loads
+            tab_bytes = max(tab_bytes, nbytes)
             cw = codes.view(torch.int32) if codes.dtype == torch.uint8 else codes
             start, rb = rb, rb + (m + rpb - 1) // rpb
             self.args += [cw, scales.reshape(-1), tab, tab.numel(), m, rb, int(x_rows[i]), self.offsets[i]]
@@ -62,8 +67,9 @@ class DenseStageCUDA:
         params = ", ".join(f"const void* C{i}, const void* S{i}, const void* T{i}, int N{i}, int M{i}, int RB{i}, "
                            f"int XR{i}, int YO{i}" for i in range(len(mats)))
         src = (f"#define TAB_BYTES {tab_bytes}\n#define ROWS_PER_HW {rps}\n#define LANES_PER_ROW {lpr}\n"
-               f"#define ROWS_PER_BLOCK {rpb}\n" + _PRELUDE + f"""
-extern "C" __global__ void __launch_bounds__({THREADS}) dense_stage(const float* __restrict__ x, int stride_x,
+               f"#define ROWS_PER_BLOCK {rpb}\n#define NTHREADS {THREADS}\n#define MAX_N 3072\n"
+               + _PRELUDE + f"""
+extern "C" __global__ void __launch_bounds__({f"{THREADS}, {minb}" if minb else THREADS}) dense_stage(const float* __restrict__ x, int stride_x,
         float* __restrict__ y, int n, {params}) {{
     extern __shared__ __align__(16) unsigned char smem[];
 {chr(10).join(cases)}
@@ -74,6 +80,7 @@ extern "C" __global__ void __launch_bounds__({THREADS}) dense_stage(const float*
     def __call__(self, x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
         """x `[R, n]` float32 (stacked inputs); returns the concatenated outputs `[total]`."""
         assert x.dtype == torch.float32 and x.stride(-1) == 1 and x.shape[-1] == self.n, (x.dtype, x.shape, x.stride())
+        assert x.data_ptr() % 16 == 0 and x.stride(0) % 4 == 0, (x.data_ptr(), x.stride())  # rows staged with 16-byte loads
         y = out if out is not None else torch.empty(self.total, dtype=torch.float32, device=x.device)
         self.kernel((self.blocks,), (THREADS,), [x, x.stride(0), y, self.n, *self.args], self.smem)
         return y
