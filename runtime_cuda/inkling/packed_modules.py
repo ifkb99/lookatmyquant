@@ -30,6 +30,10 @@ def _signs(a, device) -> torch.Tensor:
     return torch.from_numpy(np.asarray(a).astype(np.float32)).to(device)
 
 
+DEQUANT_MIN_ROWS = 32  # dense calls with at least this many rows decode the matrix once and use cuBLAS
+DEQUANT_MAX_WEIGHTS = 1 << 24  # ... up to 64 MB of float32 weights (the LM head's large buckets keep the fused kernel)
+
+
 class _Mat:
     """One packed matrix (or a stack of same-format experts) and how to run it."""
 
@@ -40,6 +44,18 @@ class _Mat:
     def __call__(self, x16, **kw):
         if "block_expert" not in kw and x16.shape[0] <= GEMV_MAX_ROWS:
             return self.gemv(x16, out=kw.get("out"))
+        if ("block_expert" not in kw and x16.shape[0] >= DEQUANT_MIN_ROWS and self.m * self.n <= DEQUANT_MAX_WEIGHTS
+                and self.codes.dim() <= 3 and (self.codes.dim() < 3 or self.codes.shape[0] == 1) and x16.is_cuda):
+            # prefill: decode the matrix once (float32, row scales applied) and run one cuBLAS float32 matmul; the
+            # fused kernel decodes every weight again for each 16-token block. 2.5-14x faster at 1024 tokens on an
+            # RTX A4500, and closer to float64 (~4e-7 relative against ~1e-5: no float16 split of the activation)
+            from .triton_kernels import packed_dequant
+
+            w = packed_dequant(self.codes, self.scales, self.fmt, self.m, self.n, lut=self.lut, levels=self.levels)
+            out = kw.get("out")
+            if out is not None:
+                return torch.mm(x16.float(), w.T, out=out)
+            return x16.float() @ w.T
         return packed_matmul(x16, self.codes, self.scales, self.fmt, self.m, self.n, lut=self.lut, levels=self.levels, **kw)
 
     def gemv(self, x, expert_ids=None, x_div=1, out=None, zero_skipped=True):

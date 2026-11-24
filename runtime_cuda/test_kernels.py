@@ -267,7 +267,10 @@ def test_moe_side_mixed_nvfp4(pure, T):
     assert err < 1e-6, err
 
 
-def test_nvfp4_grouped_matmul():
+@pytest.mark.parametrize("block_t", [16, 64])
+def test_nvfp4_grouped_matmul(block_t):
+    """64-token blocks: NVFP4's tiles need more shared memory than some GPUs have (106 KB on sm_86), and
+    `packed_matmul` then splits the blocks."""
     from runtime_cuda.inkling.formats import decode_nvfp4
 
     rng = np.random.default_rng(12)
@@ -275,7 +278,7 @@ def test_nvfp4_grouped_matmul():
     c, s, o = _rand_nvfp4(rng, E, m, n)
     expert = torch.from_numpy(rng.integers(0, E, size=P)).to(DEV)
     x = torch.randn(P, n, device=DEV)
-    be, bp = group_by_expert(expert, E, 16)
+    be, bp = group_by_expert(expert, E, block_t)
     got = packed_matmul(x, c, s, "nvfp4", m, n, levels=o, block_expert=be, block_pairs=bp, n_pairs=P).double()
     W = decode_nvfp4(c, s, o).double()
     want = torch.stack([x[p].double() @ W[e].T for p, e in enumerate(expert.tolist())])
