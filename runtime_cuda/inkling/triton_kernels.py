@@ -238,11 +238,27 @@ def packed_matmul(
         kind = KIND_TRELLIS
         kbits, g, K, hm = FMT_PARAMS[fmt]
         lev, lev_stride, lut_arg, wpr = lut, 0, lut, (n * kbits) // 32
-    grid = (triton.cdiv(m, BLOCK_M), block_expert.numel())
     with torch.cuda.device(x.device):
-        _launch(grid, x, codes, scales, lut_arg, lev, y, block_expert, block_pairs, m, n, wpr, lev_stride, x_div,
-                kind, kbits, g, K, hm, BLOCK_T, BLOCK_M, BLOCK_N, precise, sb, e4m3)
-    return y
+        while True:
+            key = (x.device.index, kind, kbits, g, K, hm, BLOCK_T, BLOCK_M, BLOCK_N, precise)
+            if key not in _TOO_BIG:
+                try:
+                    grid = (triton.cdiv(m, BLOCK_M), block_expert.numel())
+                    _launch(grid, x, codes, scales, lut_arg, lev, y, block_expert, block_pairs, m, n, wpr, lev_stride,
+                            x_div, kind, kbits, g, K, hm, BLOCK_T, BLOCK_M, BLOCK_N, precise, sb, e4m3)
+                    return y
+                except triton.runtime.errors.OutOfResources:
+                    if BLOCK_T <= 16:
+                        raise
+                    _TOO_BIG.add(key)
+            # this format's tiles don't fit at BLOCK_T tokens (e.g. 64 on a 100 KB-shared-memory GPU): each block of
+            # one expert's tokens becomes two of half the size
+            BLOCK_T //= 2
+            block_pairs = block_pairs.reshape(-1, BLOCK_T)
+            block_expert = block_expert.repeat_interleave(2)
+
+
+_TOO_BIG: set[tuple] = set()  # launch configurations that ran out of shared memory
 
 
 def _launch(grid, x, codes, scales, lut_arg, lev, y, block_expert, block_pairs, m, n, wpr, lev_stride, x_div,
