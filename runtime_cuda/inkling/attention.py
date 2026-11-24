@@ -255,7 +255,7 @@ def _prefill_flash_attn_kernel(
     T, L, KV_CAP, VRAM_CELLS, scale,
     N_REP: tl.constexpr, D: tl.constexpr, REL_EXT: tl.constexpr, WINDOW: tl.constexpr,
     BLOCK_Q: tl.constexpr, BLOCK_K: tl.constexpr,
-    RING: tl.constexpr, KV_MODE: tl.constexpr, HAS_HOST: tl.constexpr,
+    RING: tl.constexpr, KV_MODE: tl.constexpr, HAS_HOST: tl.constexpr, PREC: tl.constexpr = "ieee",
 ):
     """Tiled O(1)-memory banded FlashAttention-2 with causal/window block skipping, rel-pos bias, and sinks."""
     h = tl.program_id(0)
@@ -301,7 +301,7 @@ def _prefill_flash_attn_kernel(
             KV_CAP, VRAM_CELLS,
             D=D, BK=BLOCK_K, RING=RING, KV_MODE=KV_MODE, HAS_HOST=HAS_HOST,
         )
-        s = tl.dot(q, tl.trans(k), input_precision="ieee") * scale  # [BQ, BK]
+        s = tl.dot(q, tl.trans(k), input_precision=PREC) * scale  # [BQ, BK]
         dist = q_pos[:, None] - kk[None, :]
         ok = q_ok[:, None] & k_valid[None, :] & (dist >= 0)
         if WINDOW > 0:
@@ -321,11 +321,18 @@ def _prefill_flash_attn_kernel(
         alpha = tl.exp(m_i - m_new)
         p = tl.where(ok, tl.exp(s - m_new[:, None]), 0.0)
         l_i = l_i * alpha + tl.sum(p, axis=1)
-        acc = acc * alpha[:, None] + tl.dot(p, v, input_precision="ieee")
+        acc = acc * alpha[:, None] + tl.dot(p, v, input_precision=PREC)
         m_i = m_new
 
     out = acc / tl.where(q_ok, l_i, 1.0)[:, None]
     tl.store(OUT + q_offs[:, None] * stride_o_t + h * stride_o_h + d[None, :], out, mask=q_ok[:, None])
+
+
+# BLOCK_Q, BLOCK_K, dot precision, warps. tf32x3 (three TF32 tensor-core products, ~3e-7 relative to the "ieee"
+# float32 FMA path) is 7x faster at 1024 tokens on an RTX A4500 (14.0 -> 1.9 ms a layer); 64-query tiles win from
+# ~4K keys (184 -> 28 ms at 8K); 64 x 64 tiles spill registers. Plain tf32 costs ~3e-4.
+PREFILL_ATTN = [32, 32, "tf32x3", 4]
+PREFILL_ATTN_LONG_Q = (4096, 64)  # from this many keys, BLOCK_Q
 
 
 def prefill_attention_kv(
@@ -337,8 +344,10 @@ def prefill_attention_kv(
     kv_host=None,
     scales_host=None,
     vram_cells: int | None = None,
-    block_q: int = 32,
-    block_k: int = 32,
+    block_q: int | None = None,
+    block_k: int | None = None,
+    precision: str | None = None,
+    num_warps: int | None = None,
 ):
     """Tiled O(1)-memory banded FlashAttention-2 reading directly from a KV cache slot.
 
@@ -361,6 +370,8 @@ def prefill_attention_kv(
     qpos_i32 = q_pos.to(torch.int32).contiguous()
     out = torch.empty(T, H, D, dtype=torch.float32, device=q.device)
     with torch.cuda.device(q.device):
+        if block_q is None:
+            block_q = PREFILL_ATTN_LONG_Q[1] if L >= PREFILL_ATTN_LONG_Q[0] else PREFILL_ATTN[0]
         grid = (H, triton.cdiv(T, block_q))
         _prefill_flash_attn_kernel[grid](
             qf, kv, sc, hkv, hsc, relf, sinkf, qpos_i32, out,
@@ -374,9 +385,9 @@ def prefill_attention_kv(
             out.stride(0), out.stride(1),
             T, int(L), kv_cap, v_cells, 1.0 / math.sqrt(D),
             N_REP=n_rep, D=D, REL_EXT=rel_extent, WINDOW=window,
-            BLOCK_Q=block_q, BLOCK_K=block_k,
-            RING=ring, KV_MODE=mode_id, HAS_HOST=has_host,
-            num_warps=4, num_stages=1,
+            BLOCK_Q=block_q or PREFILL_ATTN[0], BLOCK_K=block_k or PREFILL_ATTN[1],
+            RING=ring, KV_MODE=mode_id, HAS_HOST=has_host, PREC=precision or PREFILL_ATTN[2],
+            num_warps=num_warps or PREFILL_ATTN[3], num_stages=1,
         )
     return out
 

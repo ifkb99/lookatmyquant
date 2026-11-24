@@ -113,6 +113,8 @@ class Kernel:
         for a in args:
             if isinstance(a, torch.Tensor):
                 vals.append(ctypes.c_void_p(a.data_ptr()))
+            elif a is None:  # an optional pointer: NULL
+                vals.append(ctypes.c_void_p(0))
             elif isinstance(a, int):
                 vals.append(ctypes.c_int(a))
             elif isinstance(a, float):

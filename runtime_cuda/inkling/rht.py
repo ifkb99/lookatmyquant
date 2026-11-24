@@ -58,6 +58,9 @@ def _rht_kernel(
 
 
 _FACT: dict = {}
+# rows up to which the CUDA C kernel (rot_cuda.py) runs: all of them. It is ~1.4-2.5x faster than this kernel in a
+# decode CUDA graph and 2-2.7x at 1024-token prefill on an RTX A4500 (ties at n = 1024)
+CUDA_C_MAX_ROWS = 1 << 30
 
 
 def _factors(n: int, device):
@@ -82,6 +85,15 @@ def rht(x: torch.Tensor, signs: torch.Tensor, out: bool) -> torch.Tensor:
     x2 = x.reshape(S * T, n)
     if x2.stride(-1) != 1:
         x2 = x2.contiguous()
+    if S * T <= CUDA_C_MAX_ROWS:  # the CUDA C rotation (rot_cuda.py) when NVRTC is on
+        from . import nvrtc
+
+        if nvrtc.enabled():
+            from .rot_cuda import rotation
+
+            sg = signs if signs.dtype == torch.float32 and signs.stride(-1) == 1 else signs.float().contiguous()
+            xf = x2 if x2.dtype == torch.float32 else x2.float()
+            return rotation(n, out, x.device)(xf, sg, T if signs.shape[0] > 1 else S * T).reshape(shape)
     A, B = _factors(n, x.device)
     a, b = A.shape[0], B.shape[0]
     assert a >= 16 and a & (a - 1) == 0, a

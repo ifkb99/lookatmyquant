@@ -240,6 +240,14 @@ def rel_state(rel_raw, scale, q_in, sink_w, pos, thr: float, alpha: float, n_flo
 
 
 @_fused
+def rel_only(rel_raw, scale, pos, thr: float, alpha: float, n_floor: int, full: bool):
+    """`rel_state` without the sinks (the fused decode path computes those with the stage's output rotations)."""
+    T, nh, dr = rel_raw.shape[0], scale.shape[0], scale.shape[1]
+    rel = l2_clip(rel_raw.reshape(T, nh, dr) * scale, thr)
+    return log_scale(rel, pos, alpha, n_floor) if full else rel
+
+
+@_fused
 def gate_mul(attn, gate_raw):
     return attn.reshape(gate_raw.shape) * torch.sigmoid(gate_raw)
 
@@ -257,6 +265,15 @@ def route_top8(h, router_w, router_bias, k: int, route_scale: float):
 
 
 @_fused
+def _fused_rotations(x: torch.Tensor) -> bool:
+    """Decode-sized work on the CUDA C path: rotations with their neighbouring elementwise ops fused in (rot_cuda.py)."""
+    if not x.is_cuda:
+        return False
+    from . import nvrtc
+
+    return nvrtc.enabled()
+
+
 def swiglu_f(gate_up, gate_cap: float, up_cap: float):
     return softcapped_swiglu(gate_up, gate_cap, up_cap)
 
@@ -581,7 +598,11 @@ class PackedMoE:
             pairs = torch.nonzero(loc >= 0).squeeze(1)
             if pairs.numel() == 0:
                 continue
-            be, bp = group_by_expert(loc[pairs].long(), n_local, self.BLOCK_T)
+            # tokens a block: as many as this expert set averages (up to 64), so each weight tile is decoded once
+            # for that many tokens (16 -> 64 at 1024-token prefill: 1.6x the prefill speed on an RTX A4500)
+            avg = pairs.numel() / max(n_local, 1)
+            block_t = 64 if avg >= 48 else 32 if avg >= 24 else 16
+            be, bp = group_by_expert(loc[pairs].long(), n_local, block_t)
             bp = torch.where(bp >= 0, pairs.to(torch.int32)[bp.clamp(min=0).long()], bp)
             if mat is None:
                 packed_matmul(xin, nv[0], nv[1], "nvfp4", m, n, levels=nv[2], block_expert=be, block_pairs=bp,
@@ -590,7 +611,9 @@ class PackedMoE:
                 mat(xin, block_expert=be, block_pairs=bp, n_pairs=P, x_div=x_div, out=y)
         return y
 
-    def __call__(self, h: torch.Tensor) -> torch.Tensor:
+    def __call__(self, h: torch.Tensor, combine: bool = True):
+        """The MoE output `[T, H]`; with `combine=False`, the unweighted expert outputs `[T * K, H]` and the routing
+        weights `[T, K]` (the caller fuses the weighted sum into its next kernel)."""
         T = h.shape[0]
         K = self.cfg.num_experts_per_tok
         idx, w = self.route(h)
@@ -598,9 +621,19 @@ class PackedMoE:
         grouped = T * K > 64
         rot = lambda side, a, s: rht_in(a, s) if self.sides[side][2] else None  # noqa: E731  trellis experts only
         gu = self._side("gu", rot("gu", h, self.gu_signs), h, eids, K, grouped)
-        act = swiglu_f(gu, self.cfg.mlp_gate_softcap, self.cfg.mlp_up_softcap)
+        caps = (self.cfg.mlp_gate_softcap, self.cfg.mlp_up_softcap)
+        if not grouped and self.sides["dn"][2] and _fused_rotations(gu):
+            # decode: SwiGLU fused into the down side's input rotation; NVFP4 experts also get the activation itself
+            from .rot_cuda import rotation
+
+            n = self.sides["dn"][1]
+            act = torch.empty(gu.shape[0], n, dtype=torch.float32, device=gu.device) if self.nvfp4.get("dn") is not None else None
+            dn_in = rotation(n, False, gu.device, pro=2)(gu, self.dn_signs[None], gu.shape[0], caps=caps, act=act)
+            dn = self._side("dn", dn_in, act if act is not None else dn_in, eids, 1, grouped)
+            return moe_combine(dn, w) if combine else (dn, w)
+        act = swiglu_f(gu, *caps)
         dn = self._side("dn", rot("dn", act, self.dn_signs), act, eids, 1, grouped)
-        return moe_combine(dn, w)
+        return moe_combine(dn, w) if combine else (dn, w)
 
 
 # ----------------------------------------------------------------------------- Decoder layer
@@ -662,13 +695,26 @@ class PackedDecoderLayer:
             self.mlp_gate = tuple(w[None].contiguous() for w in self.msg_gates["mlp_message_gate"])
         self.moe = PackedMoE(arrays, luts, st[p + "mlp.gate.weight"], st[p + "mlp.gate.e_score_correction_bias"], cfg, device)
 
-    def _in_stage(self, q_in, k_in, v_in):
+    def _in_stage(self, q_in, k_in, v_in, with_sinks: bool = False):
         """q, k, v, relative-bias and gate projections: one stacked input rotation, five packed matmuls, the output
-        rotations batched by size."""
+        rotations batched by size. With `with_sinks` (decode on the CUDA C path) returns (projections, sinks): the
+        output rotations and the attention sinks `q_in @ sink_w.T` in one launch (rot_cuda.StageRotations)."""
         xs = torch.stack([q_in, k_in, v_in, q_in, q_in]) if k_in is not q_in else q_in[None].expand(5, -1, -1)
         x_rot = rht_in_stack(xs, self.in_signs)
         if xs.shape[1] == 1:  # decode: the five matrices in one launch
             ys = [y[None] for y in self.in_dense.split(self.in_dense(x_rot[:, 0]))]
+            if with_sinks:
+                js = [j for g in self.out_groups.values() for j in g]
+                if getattr(self, "_stage_rot", None) is None:
+                    from .rot_cuda import StageRotations
+
+                    self._stage_rot = StageRotations([(self.in_stage[j].out_features, self.in_stage[j].signs_out) for j in js],
+                                                     q_in.device, dot_rows=self.sink_w.shape[0], dot_n=self.sink_w.shape[1])
+                outs, sinks = self._stage_rot([ys[j].reshape(-1) for j in js], q_in.reshape(-1).float().contiguous(),
+                                              self.sink_w)
+                for j, o in zip(js, outs):
+                    ys[j] = o
+                return ys, sinks
         else:
             ys = [l.mat(x_rot[j]) for j, l in enumerate(self.in_stage)]
         for m, js in self.out_groups.items():
@@ -707,7 +753,11 @@ class PackedDecoderLayer:
                 gated = message_gates_fused(qkv_h, messages[:3], *self.qkv_gate)
                 q_in, k_in, v_in = norm_f(gated, self.qkv_ln[:, None, :], eps).unbind(0)
 
-        q_raw, k_raw, v_raw, rel_raw, gate_raw = self._in_stage(q_in, k_in, v_in)
+        sinks = None
+        if decode and T == 1 and _fused_rotations(q_in):
+            (q_raw, k_raw, v_raw, rel_raw, gate_raw), sinks = self._in_stage(q_in, k_in, v_in, with_sinks=True)
+        else:
+            q_raw, k_raw, v_raw, rel_raw, gate_raw = self._in_stage(q_in, k_in, v_in)
         q = q_post(q_raw, self.q_scale, pos, cfg.qk_l2_clip_threshold, cfg.log_scaling_alpha, cfg.log_scaling_n_floor, full)
         kv = cache.kv[slot]
         kv_kw = dict(
@@ -728,8 +778,12 @@ class PackedDecoderLayer:
 
         window = cfg.sliding_window_size if self.is_sliding else 0
         if decode:
-            rel, sinks = rel_state(rel_raw, self.rel_scale, q_in, self.sink_w, pos,
-                                   cfg.rel_l2_clip_threshold, cfg.log_scaling_alpha, cfg.log_scaling_n_floor, full)
+            if sinks is None:
+                rel, sinks = rel_state(rel_raw, self.rel_scale, q_in, self.sink_w, pos,
+                                       cfg.rel_l2_clip_threshold, cfg.log_scaling_alpha, cfg.log_scaling_n_floor, full)
+            else:
+                rel = rel_only(rel_raw, self.rel_scale, pos, cfg.rel_l2_clip_threshold, cfg.log_scaling_alpha,
+                               cfg.log_scaling_n_floor, full)
             tn = tuning_for(q.device)
             attn = decode_attention(q[0], kv, rel[0], sinks[0], pos, window, cfg.rel_extent, proj=self.rel_proj,
                                     nsplit=tn.attn_nsplit, block_k=tn.attn_block_k, **kv_kw)[None]
@@ -738,19 +792,39 @@ class PackedDecoderLayer:
                                          cfg.rel_l2_clip_threshold, cfg.log_scaling_alpha, cfg.log_scaling_n_floor, full)
             L = int(pos[-1].item()) + 1  # prefill: host knows the length
             attn = prefill_attention_kv(q, kv, rel_logits, sinks, pos, L, window, cfg.rel_extent, **kv_kw)
-        attn = gate_mul(attn, gate_raw)
-        attn_out = cache.conv(slot, 2, self.o_lin(attn), self.post_attn_conv)
+        if T == 1 and self.o_lin.signs_out is not None and _fused_rotations(attn):
+            # decode: the gate fused into o_proj's input rotation; the conv and the residual add into its output one
+            from .rot_cuda import rotation
 
-        if self.is_block_boundary:
-            local_blocks, residual, h_post = block_states + [block_residual.float()], attn_out, attn_out
+            o = self.o_lin
+            x_rot = rotation(o.in_features, False, attn.device, pro=1)(attn.reshape(1, -1), o.signs_in[None], 1,
+                                                                       aux=gate_raw.reshape(1, -1).float())
+            resid = None if self.is_block_boundary else block_residual.float().reshape(-1).contiguous()
+            h_post = rotation(o.out_features, True, attn.device, epi=1)(
+                o.mat(x_rot), o.signs_out[None], 1, prev=cache.conv_state[slot][2], wc=self.post_attn_conv, resid=resid)
+            if self.is_block_boundary:
+                local_blocks, residual = block_states + [block_residual.float()], h_post
+            else:
+                local_blocks, residual = block_states, h_post
         else:
-            local_blocks = block_states
-            residual = h_post = block_residual.float() + attn_out
+            attn = gate_mul(attn, gate_raw)
+            attn_out = cache.conv(slot, 2, self.o_lin(attn), self.post_attn_conv)
+            if self.is_block_boundary:
+                local_blocks, residual, h_post = block_states + [block_residual.float()], attn_out, attn_out
+            else:
+                local_blocks = block_states
+                residual = h_post = block_residual.float() + attn_out
         if messages is None:
             h_mlp = block_attn_res_fused(self.mlp_in_q, local_blocks + [h_post], self.post_attn_ln[None], eps)[0]
         else:
             h_mlp = block_attn_res_fused(self.mlp_in_q, local_blocks + [h_post])
             h_mlp = norm_f(message_gates_fused(h_mlp, messages[3][None], *self.mlp_gate)[0], self.post_attn_ln, eps)
+        if T == 1 and _fused_rotations(h_mlp):  # decode: the combine, the conv and the residual add in one launch
+            from .rot_cuda import combine_conv_add
+
+            dn, w = self.moe(h_mlp, combine=False)
+            return combine_conv_add(dn, w.float(), cache.conv_state[slot][3], self.post_mlp_conv,
+                                    residual.float().reshape(-1).contiguous())
         mlp_out = cache.conv(slot, 3, self.moe(h_mlp), self.post_mlp_conv)
         return residual + mlp_out
 

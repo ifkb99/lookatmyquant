@@ -17,6 +17,7 @@ import triton.language as tl
 from .formats import FMT_PARAMS
 
 KIND_TRELLIS, KIND_LM8, KIND_LM6, KIND_NVFP4 = 0, 1, 2, 3
+DENSE_BLOCK_T = 16  # tokens a program for dense (one-matrix) calls; each program decodes its weight tile once
 
 
 @triton.jit
@@ -99,6 +100,71 @@ def _packed_mm_kernel(
     tl.store(yp, acc, mask=t_valid[:, None] & r_valid[None, :])
 
 
+@triton.jit
+def _packed_dequant_kernel(
+    C, S, LUT, LEV, W, M, N, WPR,
+    KIND: tl.constexpr, KBITS: tl.constexpr, G: tl.constexpr, LOGK: tl.constexpr, HASH: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    """W[r, j] = scale[r] * Q[r, j] in float32 for one dense trellis or Lloyd-Max matrix (the decode of
+    `_packed_mm_kernel`, once a weight, for a cuBLAS matmul)."""
+    rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    r_valid, c_valid = rows < M, cols < N
+    rows_c = tl.where(r_valid, rows, 0).to(tl.int64)
+    cols = tl.where(c_valid, cols, 0)
+    MASK32: tl.constexpr = 0xFFFFFFFF
+    if KIND == 0:
+        last = (cols // G) * G + (G - 1)
+        bp = (N - 1 - last) * KBITS
+        wi = bp >> 5
+        off = (bp & 31).to(tl.int64)
+        base = C + rows_c[:, None] * WPR
+        w0 = tl.load(base + wi[None, :]).to(tl.int64) & MASK32
+        w1 = tl.load(base + wi[None, :] + 1, mask=(wi[None, :] + 1) < WPR, other=0).to(tl.int64) & MASK32
+        s = ((w0 | (w1 << 32)) >> off[None, :]) & 4095
+        if HASH != 0:
+            idx = ((s * HASH) & MASK32) >> (32 - LOGK)
+        else:
+            idx = s
+        w = tl.load(LUT + idx * G + (cols % G)[None, :]).to(tl.float32)
+    elif KIND == 1:
+        b = tl.load(C + rows_c[:, None] * N + cols[None, :]).to(tl.int32) & 0xFF
+        w = tl.load(LEV + b).to(tl.float32)
+    else:
+        flat = rows_c[:, None] * N + cols[None, :]
+        grp = flat // 4
+        sub = (flat % 4).to(tl.int32)
+        b0 = tl.load(C + grp * 3).to(tl.int32) & 0xFF
+        b1 = tl.load(C + grp * 3 + 1).to(tl.int32) & 0xFF
+        b2 = tl.load(C + grp * 3 + 2).to(tl.int32) & 0xFF
+        v = b0 | (b1 << 8) | (b2 << 16)
+        q = (v >> (sub * 6)) & 63
+        w = tl.load(LEV + q).to(tl.float32)
+    sc = tl.load(S + rows_c, mask=r_valid, other=0.0).to(tl.float32)
+    tl.store(W + rows_c[:, None] * N + cols[None, :], w * sc[:, None], mask=r_valid[:, None] & c_valid[None, :])
+
+
+def packed_dequant(codes, scales, fmt: str, m: int, n: int, lut=None, levels=None) -> torch.Tensor:
+    """The dense float32 `[m, n]` matrix (row scales applied) of one trellis or Lloyd-Max matrix."""
+    if fmt.startswith("lm"):
+        kind = KIND_LM8 if fmt == "lm8" else KIND_LM6
+        kbits, g, K, hm, wpr = int(fmt[2:]), 1, 2, 0, 0
+        assert levels.dim() == 1 or levels.shape[0] == 1, "one level table"
+        tab = levels.reshape(-1)
+    else:
+        kind = KIND_TRELLIS
+        kbits, g, K, hm = FMT_PARAMS[fmt]
+        tab, wpr = lut, (n * kbits) // 32
+    w = torch.empty(m, n, dtype=torch.float32, device=codes.device)
+    BM, BN = 32, 128
+    with torch.cuda.device(codes.device):
+        _packed_dequant_kernel[(triton.cdiv(m, BM), triton.cdiv(n, BN))](
+            codes, scales.reshape(-1), tab, tab, w, m, n, wpr,
+            KIND=kind, KBITS=kbits, G=g, LOGK=int(round(math.log2(K))), HASH=hm, BLOCK_M=BM, BLOCK_N=BN)
+    return w
+
+
 def group_by_expert(expert_of_pair: torch.Tensor, num_experts: int, block_t: int):
     """Sorts pairs by expert into blocks of `block_t` (padded with -1). Returns (block_expert int32, block_pairs int32)."""
     dev = expert_of_pair.device
@@ -130,7 +196,7 @@ def packed_matmul(
     block_pairs: torch.Tensor | None = None,
     n_pairs: int | None = None,
     x_div: int = 1,
-    BLOCK_T: int = 16,
+    BLOCK_T: int | None = None,
     BLOCK_M: int | None = None,
     BLOCK_N: int | None = None,
     out: torch.Tensor | None = None,
@@ -144,7 +210,10 @@ def packed_matmul(
 
         bm, bn = tuning_for(x.device).prefill
         BLOCK_M, BLOCK_N = BLOCK_M or bm, BLOCK_N or bn
-    if block_expert is None:  # dense: one expert, X rows = output rows
+    BLOCK_T = BLOCK_T or DENSE_BLOCK_T
+    if block_expert is not None:  # the grouping's block size (group_by_expert's block_t)
+        BLOCK_T = block_pairs.numel() // block_expert.numel()
+    else:  # dense: one expert, X rows = output rows
         T = x.shape[0]
         n_pairs = T
         nb = triton.cdiv(T, BLOCK_T)
