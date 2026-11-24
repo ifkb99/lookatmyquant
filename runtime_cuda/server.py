@@ -45,6 +45,14 @@ class Engine:
                 )
             else:
                 self.prompt_cache = None
+            # One cache and decode graph for every request (Triton engine). It resumes from earlier requests'
+            # state only when prompt caching is on; `prompt_cache` then also keeps other conversations.
+            self.session = None
+            if getattr(self.model, "engine", None) == "triton":
+                from .inkling.session import CudaSession
+
+                self.session = CudaSession(self.model.target, args.context, prompt_cache=self.prompt_cache)
+                self.session_reuse = self.prompt_cache is not None
         except BaseException:
             self.stack.close()
             raise
@@ -142,7 +150,11 @@ class Engine:
             draft_block_size=self.draft_block_size, temperature=job["temperature"],
             seed=job["seed"],
         )
-        if self.prompt_cache is not None and job.get("use_cache", True):
+        if self.session is not None:
+            stream_kw["session"] = self.session
+            stream_kw["use_cache"] = self.session_reuse and job.get("use_cache", True)
+            stream_kw["stats_out"] = stats
+        elif self.prompt_cache is not None and job.get("use_cache", True):
             stream_kw["prompt_cache"] = self.prompt_cache
             stream_kw["stats_out"] = stats
         with self.lock:

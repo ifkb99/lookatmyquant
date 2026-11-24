@@ -18,7 +18,8 @@ from .model import Inkling2Cache, Inkling2LoopPacked
 class GreedyDecodeGraph:
     """A captured greedy decode step bound to one cache. `tok` holds the input token and receives the output."""
 
-    def __init__(self, model: Inkling2LoopPacked, cache: Inkling2Cache, max_steps: int, blocked: Sequence[int] = ()):
+    def __init__(self, model: Inkling2LoopPacked, cache: Inkling2Cache, max_steps: int, blocked: Sequence[int] = (),
+                 scratch: Inkling2Cache | None = None):
         self.model, self.cache, self.blocked = model, cache, frozenset(int(t) for t in blocked)
         self.cols = cols = model.blocked_columns(self.blocked)  # held: the graph reads this memory
         dev = model.device
@@ -26,7 +27,8 @@ class GreedyDecodeGraph:
         self.out = torch.zeros(max_steps + 1, dtype=torch.long, device=dev)
         self.step = torch.zeros(1, dtype=torch.long, device=dev)
         # warm up on a scratch cache: Triton compiles, rotation factors and block tables get created outside capture
-        scratch = model.make_cache(
+        # (`scratch` may be `cache` itself, when the caller resets it afterwards)
+        scratch = scratch if scratch is not None else model.make_cache(
             cache.capacity,
             global_kv_mode=cache.global_kv_mode,
             kv_vram_cells=cache.kv_vram_cells,
@@ -101,6 +103,8 @@ def stream_serial(
         logits[-1, sorted(blocked)] = float("-inf")
     first = int(logits[-1].argmax())
     t1 = time.perf_counter()
+    if stats_out is not None:  # before the first yield: a caller that stops reading early never resumes us
+        stats_out.update(prompt_tokens=len(ids), prompt_cached_tokens=reused, prompt_s=round(t1 - t0, 4))
     yield [first]
     emitted, step_ms = 1, []
     if first not in eos and max_tokens > 1:

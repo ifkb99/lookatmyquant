@@ -137,21 +137,36 @@ def _native_tokens(model, ids, limit, eos, blocked, drafter, block, temperature,
                 return
 
 
-def _triton_tokens(model, ids, limit, eos, blocked, temperature, seed, stats, prompt_cache=None):
+def _triton_tokens(model, ids, limit, eos, blocked, temperature, seed, stats, prompt_cache=None, session=None,
+                   use_cache=True):
     from .inkling.generate import stream_serial
 
+    if session is not None:
+        blocked_ids = () if blocked is None else (blocked,)
+        tokens = session.stream(ids, max_tokens=limit, eos_ids=eos, blocked=blocked_ids, temperature=temperature,
+                                seed=seed, use_cache=use_cache, stats_out=stats)
+        try:
+            yield from tokens
+        finally:
+            tokens.close()
+            if "prompt_s" in stats:
+                stats["prefill_seconds"] = stats["prompt_s"]
+        return
     if not temperature:
         blocked_ids = () if blocked is None else (blocked,)
         triton_stats = {}
-        for chunk in stream_serial(model.target, ids, max_tokens=limit, eos_ids=eos, blocked=blocked_ids,
-                                   prompt_cache=prompt_cache, stats_out=triton_stats):
-            yield from chunk
-        if triton_stats:
-            stats.update(
-                prefill_seconds=triton_stats["prompt_s"],
-                peak_gb=triton_stats["peak_gb"],
-                prompt_cached_tokens=triton_stats.get("prompt_cached_tokens", 0),
-            )
+        try:
+            for chunk in stream_serial(model.target, ids, max_tokens=limit, eos_ids=eos, blocked=blocked_ids,
+                                       prompt_cache=prompt_cache, stats_out=triton_stats):
+                yield from chunk
+        finally:
+            if triton_stats:
+                stats.update(
+                    prefill_seconds=triton_stats["prompt_s"],
+                    prompt_cached_tokens=triton_stats.get("prompt_cached_tokens", 0),
+                )
+                if "peak_gb" in triton_stats:
+                    stats["peak_gb"] = triton_stats["peak_gb"]
         return
 
     import torch
@@ -190,7 +205,7 @@ def _triton_tokens(model, ids, limit, eos, blocked, temperature, seed, stats, pr
 
 
 def stream_tokens(model, ids, *, max_tokens, eos_ids=(), blocked_token=None, drafter=None, draft_block_size=2,
-                  temperature=0., seed=None, stats_out=None, prompt_cache=None):
+                  temperature=0., seed=None, stats_out=None, prompt_cache=None, session=None, use_cache=True):
     """Yield generated token IDs, including EOS when generated."""
     if model.target is None:
         raise RuntimeError("The CUDA model is closed")
@@ -215,7 +230,7 @@ def stream_tokens(model, ids, *, max_tokens, eos_ids=(), blocked_token=None, dra
                                 temperature, seed, stats)
     else:
         tokens = _triton_tokens(model, ids, max_tokens, eos, blocked_token, temperature, seed, stats,
-                                prompt_cache=prompt_cache)
+                                prompt_cache=prompt_cache, session=session, use_cache=use_cache)
     start = time.perf_counter()
     first = last = None
     count = 0
